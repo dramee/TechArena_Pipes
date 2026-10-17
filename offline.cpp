@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
@@ -273,6 +274,102 @@ static Result heuristic(const Test& t, bool oracle, double w2, int K) {
     return r;
 }
 
+
+// ---------------------------------------------------------------------------
+// Эвристика зон: траншея фиксированной длины T. Долгоживущие трубы (срок жизни >= thr событий, либо
+// "не удаляются никогда" при thr = LLONG_MAX) берут самую левую подходящую дырку и прижимаются влево;
+// короткоживущие берут самую маленькую подходящую дырку (из равных самую правую) и прижимаются вправо.
+// Так постоянные трубы копятся снизу, а временные занимают и освобождают верхнюю часть.
+// ---------------------------------------------------------------------------
+struct ZoneEngine {
+    const Test& t;
+    int T;
+    ll thr;
+    unordered_map<int, int> byStart, byEnd;
+    set<int> buckets[MAXL + 2];
+    vector<int> pos;
+
+    ZoneEngine(const Test& tt, int T_, ll th) : t(tt), T(T_), thr(th) { pos.assign(t.pipes.size(), -1); }
+    static int bucketOf(int s) { return min(s, MAXL + 1); }
+    void addFree(int s, int e) { byStart[s] = e; byEnd[e] = s; buckets[bucketOf(e - s)].insert(s); }
+    int removeFree(int s) {
+        auto it = byStart.find(s);
+        if (it == byStart.end()) return s;
+        int e = it->second;
+        byStart.erase(it); byEnd.erase(e);
+        buckets[bucketOf(e - s)].erase(s);
+        return e;
+    }
+    bool longLived(int pid) const {
+        const Pipe& pp = t.pipes[pid];
+        if (thr == LLONG_MAX) return pp.rem == t.m;
+        return (ll)pp.rem - pp.laid >= thr;
+    }
+    bool place(int pid) {
+        int L = t.pipes[pid].len;
+        int s = -1, D = 0;
+        if (longLived(pid)) {
+            for (int b = L; b <= MAXL + 1; b++)
+                if (!buckets[b].empty() && (s < 0 || *buckets[b].begin() < s)) s = *buckets[b].begin();
+            if (s < 0) return false;
+            int e = removeFree(s);
+            D = s;
+            if (s + L < e) addFree(s + L, e);
+        } else {
+            for (int b = L; b <= MAXL + 1; b++)
+                if (!buckets[b].empty()) { s = *buckets[b].rbegin(); break; }
+            if (s < 0) return false;
+            int e = removeFree(s);
+            D = e - L;
+            if (s < D) addFree(s, D);
+        }
+        pos[pid] = D;
+        return true;
+    }
+    void release(int pid) {
+        int L = t.pipes[pid].len, s = pos[pid];
+        int ns = s, ne = s + L;
+        auto li = byEnd.find(s);
+        if (li != byEnd.end()) { int ls = li->second; removeFree(ls); ns = ls; }
+        if (byStart.count(ne)) ne = removeFree(ne);
+        addFree(ns, ne);
+    }
+    bool run() {
+        addFree(0, T);
+        for (int e = 0; e < t.m; e++) {
+            int c = t.cmds[e];
+            if (c > 0) { if (!place(t.evPid[e])) return false; }
+            else release(-c);
+        }
+        return true;
+    }
+};
+
+// Ищет наименьшее T (кратное 20) из [LB, hiT - 20], при котором эвристика зон справляется. Монотонность по T предполагается.
+static Result zoneSearch(const Test& t, ll LB, ll hiT, ll thr) {
+    Result r;
+    if (hiT - 20 < LB || LB <= 0) return r;
+    auto feasible = [&](ll T, vector<int>* out) {
+        ZoneEngine z(t, (int)T, thr);
+        if (!z.run()) return false;
+        if (out) *out = z.pos;
+        return true;
+    };
+    ll lo = 0, hi = (hiT - 20 - LB) / 20;           // индексы k: T = LB + 20k
+    vector<int> tmp;
+    if (!feasible(LB + 20 * hi, &tmp)) return r;    // даже самая большая T из допустимых не помогает
+    vector<int> bestPos = tmp;
+    while (lo < hi) {
+        ll mid = (lo + hi) / 2;
+        if (feasible(LB + 20 * mid, &tmp)) { hi = mid; bestPos = tmp; }
+        else lo = mid + 1;
+    }
+    ll ext;
+    if (!verify(t, bestPos, ext)) return r;
+    r.T = ceil20(ext); r.pos = bestPos; r.ok = true;
+    return r;
+}
+
 int main(int argc, char** argv) {
     string dumpDir;
     double w2only = -1;
@@ -325,11 +422,28 @@ int main(int argc, char** argv) {
         Result best = orc.ok ? orc : on;
         if (on.ok && (!best.ok || on.T < best.T)) best = on;
 
-        string status;
+        // зоны: перебираем пороги долгоживучести, берём лучшее
+        Result zon;
+        string zonName;
+        if (best.ok && best.T > LB) {
+            vector<ll> thrs = {LLONG_MAX, 5000, 1000, 300, 100, 30};
+            for (ll th : thrs) {
+                Result r = zoneSearch(t, LB, best.T, th);
+                if (r.ok && (!zon.ok || r.T < zon.T)) {
+                    zon = r;
+                    zonName = th == LLONG_MAX ? "навсегда" : ">=" + to_string(th);
+                }
+            }
+            if (zon.ok && zon.T < best.T) best = zon; else zonName.clear();
+        }
+
+        string status, zpre;
+        if (!zonName.empty() && zon.ok && best.T == zon.T) zpre = "[зоны " + zonName + "] ";
+        status = zpre;
         if (!best.ok) status = "ОШИБКА эвристики";
-        else if (best.T == LB) status = "OPT (T = LB)";
+        else if (best.T == LB) status += "OPT (T = LB)";
         else {
-            status = "эвристика, зазор до LB " + to_string(best.T - LB) + " м";
+            status += "эвристика, зазор до LB " + to_string(best.T - LB) + " м";
             if (t.m <= maxExactEvents) {
                 bool unknown = false, found = false;
                 for (ll T = LB; T < best.T; T += 20) {
@@ -342,8 +456,8 @@ int main(int argc, char** argv) {
                     }
                     if (ex.aborted) unknown = true;
                 }
-                if (found) status = unknown ? "лучше эвристики, оптимум не доказан" : "OPT (перебор)";
-                else status = unknown ? "эвристика, перебор не завершён" : "OPT (перебор, эвристика оптимальна)";
+                if (found) status = zpre + (unknown ? "лучше эвристики, оптимум не доказан" : "OPT (перебор)");
+                else status = zpre + (unknown ? "эвристика, перебор не завершён" : "OPT (перебор, эвристика оптимальна)");
             } else {
                 status += "; перебор пропущен (много событий)";
             }
