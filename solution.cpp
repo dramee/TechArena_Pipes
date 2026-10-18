@@ -8,11 +8,20 @@
 //   огрызки по 1-3 м. На коротких тестах лучше KMIN=4, на длинных KMIN=16,
 //   поэтому после 500-й трубы порог переключается.
 //
+// Режим 3 (предсказание периодичности): если длины входящих труб после последнего удаления образуют
+//   периодическую последовательность (минимум PRIOR_REPS периодов подряд), считаем, что в таком потоке
+//   удалят позиции с чётным номером внутри периода (так устроены открытые адверсарные тесты). Предполагаемые
+//   к удалению трубы кладём вплотную к правому краю, остальные к левому, чтобы после удаления освободились
+//   большие непрерывные блоки. Предположение проверяется по реальным удалениям и отключается навсегда,
+//   если оно оказывается неверным чаще, чем верным.
+//
 // Режим 2 (фазовый): включается, если обнаружена пачка из >= MIN_RUN труб одной
-//   длины, в которой затем удалили каждую вторую. Тогда в следующих пачках:
-//     - трубы, которые по выученной чётности будут удалены, кладём к концу траншеи;
+//   длины, в которой затем удалили часть труб по периодическому шаблону: каждый
+//   остаток позиции по модулю p (p = 2..MAX_PERIOD) удалён целиком либо не тронут
+//   (каждая вторая, каждая третья, две из трёх и т. д.). Тогда в следующих пачках:
+//     - трубы, которые по выученному шаблону будут удалены, кладём к концу траншеи;
 //     - остальные - к началу;
-//     - копаем сразу на всю оставшуюся пачку.
+//     - копаем сразу на ожидаемый остаток пачки (среднее длин двух последних пачек).
 //   Так удаления освобождают один непрерывный блок вместо россыпи дыр размера k,
 //   в которые трубы следующей пачки (размер k+1) физически не влезают.
 #include <cstdio>
@@ -33,6 +42,13 @@ typedef long long ll;
 
 static const int SM = 40;          // максимальная длина трубы
 static const int MIN_RUN = 20;     // пачка короче не считается фазовой
+static const int MAX_PERIOD = 8;
+#ifndef PRIOR_PERIODIC
+#define PRIOR_PERIODIC 1   // предсказание: в периодической последовательности длин удаляют позиции с чётным номером внутри периода
+#endif
+static const int PRIOR_MAX_PERIOD = 12;
+static const int PRIOR_MIN_PERIOD = 3;   // меньшие периоды слишком часто возникают случайно
+static const int PRIOR_REPS = 6;         // сколько периодов подряд должно совпасть, чтобы поверить в периодичность   // максимальный период шаблона удалений внутри серии
 static const ll SWITCH_AT = 500;   // после скольких труб поднять порог остатка
 static ll KMIN = 4;
 static const ll GUARD = 100;   // правило правой дыры работает только на коротких траншеях
@@ -108,6 +124,21 @@ static bool rightFit(ll L, ll& hs, ll& hl) {  // самая правая под�
     hs = b; hl = fa[b]; return true;
 }
 
+// Наименьший период p (2..PRIOR_MAX_PERIOD), которому подчиняются последние 3p длин, при условии что в периоде есть разные длины.
+static int detectPeriod(const vector<int>& v) {
+    int n = (int)v.size();
+    for (int p = PRIOR_MIN_PERIOD; p <= PRIOR_MAX_PERIOD; p++) {
+        if (n < PRIOR_REPS * p) break;
+        bool ok = true;
+        for (int i = n - PRIOR_REPS * p; i + p < n && ok; i++) if (v[i] != v[i + p]) ok = false;
+        if (!ok) continue;
+        bool allSame = true;
+        for (int i = n - p + 1; i < n; i++) if (v[i] != v[n - p]) allSame = false;
+        if (!allSame) return p;
+    }
+    return 0;
+}
+
 static inline int readInt() {
     int c = GETC();
     while (c != '-' && (c < '0' || c > '9')) { if (c == EOF) return INT_MIN; c = GETC(); }
@@ -124,9 +155,13 @@ int main() {
     vector<int> runId;          runId.reserve(200005);  runId.push_back(-1);
 
     int curSize = -1, curRun = 0, curCount = 0;
+    vector<int> runLens;                       // длины укладок после последнего удаления (для поиска периода)
+    vector<signed char> predDoom;              // предсказание судьбы трубы: -1 нет, 0 останется, 1 удалят
+    predDoom.reserve(200005); predDoom.push_back(-1);
+    ll priorHit = 0, priorMiss = 0; bool priorBad = false;
     vector<int> remIdx;                        // позиции удалённых труб текущей пачки
     bool havePattern = false;
-    int patParity = 0, patRunLen = 0;
+    int patPeriod = 2, patMask = 0, patRunLen = 0, patRunLenPrev = 0, expLen = 0;   // шаблон: удаляются позиции i, у которых (patMask >> (i % patPeriod)) & 1
 
     for (;;) {
         int cmd = readInt();
@@ -137,13 +172,27 @@ int main() {
 
             if ((int)L != curSize) {           // пачка сменилась: анализируем предыдущую
                 if (curSize >= 0 && curCount >= MIN_RUN && !remIdx.empty()) {
-                    bool same = true; int par = remIdx[0] & 1;
-                    for (size_t i = 1; i < remIdx.size(); i++)
-                        if ((remIdx[i] & 1) != par) { same = false; break; }
                     ll cnt = (ll)remIdx.size();
-                    if (same && cnt * 3 >= curCount && cnt * 3 <= (ll)curCount * 2) {
-                        havePattern = true; patParity = par; patRunLen = curCount;
-                    } else havePattern = false;
+                    bool found = false;
+                    if (cnt * 4 >= curCount && cnt * 4 <= (ll)curCount * 3) {
+                        // ищем наименьший период p, при котором каждый остаток по модулю p либо удалён целиком, либо не тронут
+                        for (int p = 2; p <= MAX_PERIOD && !found; p++) {
+                            int remC[MAX_PERIOD] = {0}, totC[MAX_PERIOD] = {0};
+                            for (int i = 0; i < curCount; i++) totC[i % p]++;
+                            for (size_t i = 0; i < remIdx.size(); i++) remC[remIdx[i] % p]++;
+                            bool ok = true; int mask = 0;
+                            for (int r = 0; r < p && ok; r++) {
+                                if (remC[r] == totC[r] && totC[r] > 0) mask |= 1 << r;
+                                else if (remC[r] != 0) ok = false;
+                            }
+                            if (ok && mask != 0 && mask != (1 << p) - 1) {
+                                found = true; patPeriod = p; patMask = mask;
+                                patRunLenPrev = havePattern ? patRunLen : curCount; patRunLen = curCount;
+                                expLen = (patRunLen + patRunLenPrev) / 2;   // ожидаемая длина следующей серии (среднее двух последних)
+                            }
+                        }
+                    }
+                    havePattern = found;
                 }
                 curSize = (int)L; curRun++; curCount = 0; remIdx.clear();
             }
@@ -151,7 +200,19 @@ int main() {
             if (++laid == SWITCH_AT) KMIN = 16;
             int idx = curCount++;
             bool phase  = havePattern && patRunLen >= MIN_RUN;
-            bool doomed = phase && ((idx & 1) == patParity);
+            bool doomed = phase && (((patMask >> (idx % patPeriod)) & 1) != 0);
+            bool prior = false;                // решение принято по предположению, а не по выученному шаблону
+            runLens.push_back((int)L);
+            if (!phase && !priorBad) {
+#if PRIOR_PERIODIC
+                int per = detectPeriod(runLens);
+                if (per > 0) {
+                    int res = (int)(runLens.size() - 1) % per;
+                    phase = true; prior = true;
+                    doomed = (res % 2 == 0) && !(per % 2 == 1 && res == per - 1);
+                }
+#endif
+            }
 
             ll hs = -1, hl = -1, D, dig = 0;
             bool got = !phase ? goodFit(L, hs, hl)
@@ -165,8 +226,8 @@ int main() {
                 auto e = fe.find(trench);
                 if (e != fe.end()) { ts = e->second; tl = trench - ts; delRaw(ts, tl); }
                 ll need = L - tl;
-                if (phase) {                      // копаем сразу на остаток пачки
-                    ll rest = (ll)(patRunLen - idx) * L - tl;
+                if (phase && !prior) {            // копаем сразу на остаток пачки
+                    ll rest = (ll)(expLen - idx) * L - tl;
                     if (rest > need) need = rest;
                 }
                 dig = (need + 19) / 20;
@@ -177,6 +238,7 @@ int main() {
             }
 
             pipes.push_back({D, L}); runIdx.push_back(idx); runId.push_back(curRun);
+            predDoom.push_back(prior ? (doomed ? 1 : 0) : -1);
             printf("%lld %lld\n", dig, D);
             fflush(stdout);
         } else {
@@ -185,6 +247,11 @@ int main() {
             fflush(stdout);
             addFree(pipes[k].first, pipes[k].second);
             if (runId[k] == curRun) remIdx.push_back(runIdx[k]);
+            if (predDoom[k] >= 0) {                   // сверяем предположение с реальностью
+                if (predDoom[k] == 1) priorHit++; else priorMiss++;
+                if (priorHit + priorMiss >= 50 && priorMiss > priorHit) priorBad = true;
+            }
+            runLens.clear();
             pipes[k] = {-1, -1};
         }
     }
