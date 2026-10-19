@@ -71,35 +71,47 @@ static ll KMIN = 4;
 static ll trenchLen = 0;                 // текущая длина траншеи (нужна внутри goodFit)
 
 // Дыры. Позиции и длины укладываются в int: интерактор ограничивает траншею 1e8 м.
-//   hLen[s] - длина дыры, начинающейся в s (0 - дыры нет);
-//   hBeg[e] - начало+1 дыры, кончающейся в e (0 - дыры нет);
+//   hLen(s) - длина дыры, начинающейся в s (0 - дыры нет);
+//   hBeg(e) - начало+1 дыры, кончающейся в e (0 - дыры нет);
 //   ba[k]   - начала дыр длины k (1..40), ba[41] - начала дыр длиннее 40;
 //   big     - дыры длиннее 40, упорядоченные по (длина, начало).
-static vector<int> hLen, hBeg;
+// hLen/hBeg - массивы по позиции, разбитые на страницы по 64K: память растёт вместе с траншеей
+// (8 байт на метр), без перевыделений и копирования при росте.
+struct PagedArray {
+    static const int SH = 16, PS = 1 << SH;
+    vector<int*> pages;
+    ~PagedArray() { for (int* p : pages) free(p); }
+    int get(ll i) const { size_t k = (size_t)(i >> SH); return k < pages.size() && pages[k] ? pages[k][i & (PS - 1)] : 0; }
+    void set(ll i, int v) {
+        size_t k = (size_t)(i >> SH);
+        if (k >= pages.size()) pages.resize(k + 1, nullptr);
+        if (!pages[k]) pages[k] = (int*)calloc(PS, sizeof(int));
+        pages[k][i & (PS - 1)] = v;
+    }
+};
+static PagedArray hLenA, hBegA;
 static set<int> ba[SM + 2];
 static set<pair<int,int>> big;
 
 static inline int bk(ll l) { return (int)(l < SM + 1 ? l : SM + 1); }
-static inline void ensurePos(ll p) {
-    if ((ll)hLen.size() <= p) { size_t n = (size_t)p + 1; if (n < 2 * hLen.size()) n = 2 * hLen.size(); hLen.resize(n, 0); hBeg.resize(n, 0); }
-}
+static inline ll hLen(ll s) { return hLenA.get(s); }
 static inline void addRaw(ll s, ll len) {
     if (len <= 0) return;
-    ensurePos(s + len);
-    hLen[s] = (int)len; hBeg[s + len] = (int)s + 1;
+    hLenA.set(s, (int)len); hBegA.set(s + len, (int)s + 1);
     ba[bk(len)].insert((int)s);
     if (len > SM) big.insert({(int)len, (int)s});
 }
 static inline void delRaw(ll s, ll len) {
-    hLen[s] = 0; hBeg[s + len] = 0;
+    hLenA.set(s, 0); hBegA.set(s + len, 0);
     ba[bk(len)].erase((int)s);
     if (len > SM) big.erase({(int)len, (int)s});
 }
-static inline ll holeEndingAt(ll e) { return e < (ll)hBeg.size() && hBeg[e] ? hBeg[e] - 1 : -1; }
+static inline ll holeEndingAt(ll e) { int b = hBegA.get(e); return b ? b - 1 : -1; }
 static void addFree(ll s, ll len) {           // освободить участок со склейкой соседей
     ll ps = holeEndingAt(s);
     if (ps >= 0) { ll pl = s - ps; delRaw(ps, pl); s = ps; len += pl; }
-    if (s + len < (ll)hLen.size() && hLen[s + len]) { ll nl = hLen[s + len]; delRaw(s + len, nl); len += nl; }
+    ll nl = hLen(s + len);
+    if (nl) { delRaw(s + len, nl); len += nl; }
     addRaw(s, len);
 }
 
@@ -108,14 +120,14 @@ static bool leftFit(ll L, ll& hs, ll& hl) {   // самая левая подх�
     for (int k = (int)L; k <= SM + 1; k++)
         if (!ba[k].empty() && *ba[k].begin() < b) { b = *ba[k].begin(); bl = k; }
     if (bl < 0) return false;
-    hs = b; hl = hLen[b]; return true;
+    hs = b; hl = hLen(b); return true;
 }
 static bool rightFit(ll L, ll& hs, ll& hl) {  // самая правая подходящая дыра
     ll b = -1; int bl = -1;
     for (int k = (int)L; k <= SM + 1; k++)
         if (!ba[k].empty() && *ba[k].rbegin() > b) { b = *ba[k].rbegin(); bl = k; }
     if (bl < 0) return false;
-    hs = b; hl = hLen[b]; return true;
+    hs = b; hl = hLen(b); return true;
 }
 
 // Первая непустая корзина размеров [lo, hi] (по возрастанию), минуя дыру ban; из равных по
@@ -201,7 +213,6 @@ int main() {
 #ifdef SIM   // локальный режим: тест читается из stdin без интерактора (заголовок "вес n" пропускаем)
     { double w; int n; if (scanf("%lf %d", &w, &n) != 2) return 1; }
 #endif
-    hLen.resize(1 << 16, 0); hBeg.resize(1 << 16, 0);
     vector<pair<ll,ll>> pipes;  pipes.reserve(200005);  pipes.push_back({-1,-1});
     vector<int> runIdx;         runIdx.reserve(200005); runIdx.push_back(-1);
     vector<int> runId;          runId.reserve(200005);  runId.push_back(-1);
