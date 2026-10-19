@@ -5,9 +5,22 @@
 //
 // Режим 1 (обычный): best-fit с приоритетом точного совпадения по размеру.
 //   Порог KMIN: предпочитаем дыру, оставляющую остаток >= KMIN, чтобы не плодить
-//   огрызки по 1-3 м. На коротких тестах лучше KMIN=4, на длинных KMIN=16,
-//   поэтому после 500-й трубы порог переключается (KMIN1=24: остаток >= 20 м ещё вмещает
-//   типичную длинную трубу, остаток короче - мёртвая дыра).
+//   огрызки по 1-3 м. На коротких тестах лучше KMIN=4, на длинных KMIN=24 (остаток >= 20 м
+//   ещё вмещает типичную длинную трубу, остаток короче - мёртвая дыра), поэтому после
+//   500-й трубы порог переключается.
+//
+// Режим 2 (фазовый): включается, если обнаружена пачка из >= MIN_RUN труб одной
+//   длины (пачка кончается при смене длины или после всплеска удалений), в которой затем
+//   удалили часть труб по периодическому шаблону: каждый остаток позиции по модулю p
+//   (p = 2..MAX_PERIOD) удалён целиком либо не тронут (каждая вторая, каждая третья,
+//   две из трёх и т. д.). Тогда в следующих пачках:
+//     - трубы, которые по выученному шаблону будут удалены, кладём к концу траншеи;
+//     - остальные - к началу;
+//     - копаем сразу на ожидаемый остаток пачки (среднее длин двух последних пачек), но
+//       только если прогноз уже сбывался (в пределах 10%); иначе - не больше уложенного в пачке
+//       (иначе после короткой пачки раскопанный про запас хвост остаётся пустым навсегда).
+//   Так удаления освобождают один непрерывный блок вместо россыпи дыр размера k,
+//   в которые трубы следующей пачки (размер k+1) физически не влезают.
 //
 // Режим 3 (предсказание периодичности): если длины входящих труб после последнего удаления образуют
 //   периодическую последовательность (минимум PRIOR_REPS периодов подряд), считаем, что в таком потоке
@@ -16,40 +29,26 @@
 //   большие непрерывные блоки. Предположение проверяется по реальным удалениям и отключается навсегда,
 //   если оно оказывается неверным чаще, чем верным.
 //
-// Режим 4 (выученная судьба позиций периода, LEARN_FATE): период ищется по всем укладкам подряд
+// Режим 4 (выученная судьба позиций периода): период ищется по всем укладкам подряд
 //   (удаления его не сбрасывают). Каждую трубу «судим» через L4_H укладок: удалили её за это время
 //   или нет. Если каждая позиция периода почти всегда удаляется либо почти никогда (>= 80% / <= 20%),
 //   кладём по выученному шаблону:
 //     - остающиеся - в дыру точно по размеру, иначе в хвост траншеи (плотный рост без дыр);
-//     - обречённые - best-fit по дырам: они переиспользуют места прошлых обречённых.
+//     - обречённые - best-fit по дырам: они переиспользуют места прошлых обречённых;
+//       хвост копаем сразу под все обречённые трубы текущего периода.
 //   Главное - остающиеся не занимают и не дробят дыры, которые освобождают обречённые.
 //   Если прогнозы ошибаются чаще чем в 20% случаев, режим выключается навсегда.
 //
 // Сборка с -DSIM читает тест из stdin без интерактора и печатает итоговый KPI в stderr.
-//
-// Режим 2 (фазовый): включается, если обнаружена пачка из >= MIN_RUN труб одной
-//   длины (пачка кончается при смене длины или после всплеска удалений, SPLIT_RUNS), в которой затем удалили часть труб по периодическому шаблону: каждый
-//   остаток позиции по модулю p (p = 2..MAX_PERIOD) удалён целиком либо не тронут
-//   (каждая вторая, каждая третья, две из трёх и т. д.). Тогда в следующих пачках:
-//     - трубы, которые по выученному шаблону будут удалены, кладём к концу траншеи;
-//     - остальные - к началу;
-//     - копаем сразу на ожидаемый остаток пачки (среднее длин двух последних пачек), но
-//       только если прогноз уже сбывался (в пределах 10%); иначе - не больше уложенного в пачке
-//       (иначе после короткой пачки раскопанный про запас хвост остаётся пустым навсегда).
-//   Так удаления освобождают один непрерывный блок вместо россыпи дыр размера k,
-//   в которые трубы следующей пачки (размер k+1) физически не влезают.
 #include <cstdio>
 #include <cstdlib>
 #include <climits>
 #include <vector>
-#include <map>
-#include <unordered_map>
 #include <set>
 #include <utility>
-#include <cmath>
 
-#if defined(_WIN32) || defined(_MSC_VER)
-  #define GETC getchar
+#if defined(_WIN32)
+  #define GETC _getchar_nolock
 #else
   #define GETC getchar_unlocked
 #endif
@@ -58,134 +57,78 @@ typedef long long ll;
 
 static const int SM = 40;          // максимальная длина трубы
 static const int MIN_RUN = 20;     // пачка короче не считается фазовой
-static const int MAX_PERIOD = 8;
-#ifndef PRIOR_PERIODIC
-#define PRIOR_PERIODIC 1   // предсказание: в периодической последовательности длин удаляют позиции с чётным номером внутри периода
-#endif
+static const int MAX_PERIOD = 8;   // максимальный период шаблона удалений внутри пачки
 static const int PRIOR_MAX_PERIOD = 12;
 static const int PRIOR_MIN_PERIOD = 3;   // меньшие периоды слишком часто возникают случайно
-static const int PRIOR_REPS = 6;         // сколько периодов подряд должно совпасть, чтобы поверить в периодичность   // максимальный период шаблона удалений внутри серии
-#ifndef SWITCH_AT_V
-#define SWITCH_AT_V 500
-#endif
-#ifndef KMIN0
-#define KMIN0 4
-#endif
-#ifndef KMIN1
-#define KMIN1 24
-#endif
-#ifndef CAP_MULT
-#define CAP_MULT 1
-#endif
-#ifndef SPLIT_RUNS
-#define SPLIT_RUNS 1   // новая пачка начинается и после всплеска удалений, даже если длина труб не сменилась
-#endif
-#ifndef LEARN_FATE
-#define LEARN_FATE 1   // режим 4: выученная судьба позиций периода
-#endif
-#ifndef L4_H
-#define L4_H 64        // режим 4: через сколько укладок трубу считаем оставшейся навсегда
-#endif
-#ifndef L4_KEPT
-#define L4_KEPT 3      // режим 4: остающиеся трубы: 3 - дыра точно по размеру, иначе хвост; 2 - хвост; 1 - best-fit; 0 - самая левая дыра
-#endif
-#ifndef L4_EXACT
-#define L4_EXACT 1     // режим 4: обречённая труба сначала ищет дыру точно по размеру
-#endif
-#ifndef L4_DOOM
-#define L4_DOOM 1      // режим 4: обречённые - best-fit по всем дырам (0 - самая правая дыра)
-#endif
-#ifndef L4_DRIGHT
-#define L4_DRIGHT 0    // режим 4: обречённую прижимать к правому краю дыры (1) или к левому (0)
-#endif
-#ifndef L4_PURE
-#define L4_PURE 80     // режим 4: позиция считается чистой, если её удаляют в >= L4_PURE% случаев или в <= 100-L4_PURE%
-#endif
-#ifndef L4_DIG
-#define L4_DIG 1       // режим 4: копать сразу под все обречённые трубы текущего периода
-#endif
-#ifndef GUARD_V
-#define GUARD_V 100
-#endif
-static const ll SWITCH_AT = SWITCH_AT_V;   // после скольких труб поднять порог остатка
-static ll KMIN = KMIN0;
-static const ll GUARD = GUARD_V;   // правило правой дыры работает только на коротких траншеях
-static ll trenchLen = 0;       // текущая длина траншеи (нужна внутри goodFit)
+static const int PRIOR_REPS = 6;         // сколько периодов подряд должно совпасть, чтобы поверить в периодичность
+static const ll SWITCH_AT = 500;         // после скольких труб поднять порог остатка
+static const ll KMIN1 = 24;
+static const ll GUARD = 100;             // правило правой дыры работает только на коротких траншеях
+static const ll CAP_MULT = 1;            // без подтверждённого прогноза копаем вперёд не больше CAP_MULT x уложенного в пачке
+static const int L4_H = 64;              // режим 4: через сколько укладок трубу считаем оставшейся навсегда
+static const int L4_PURE = 80;           // режим 4: позиция чистая, если её удаляют в >= 80% случаев или в <= 20%
+static ll KMIN = 4;
+static ll trenchLen = 0;                 // текущая длина траншеи (нужна внутри goodFit)
 
-static map<ll,ll> fa, fe;          // дыры: start -> len, end -> start
-static set<pair<ll,ll>> bySize;    // (len, start)
-static set<ll> ba[SM+2];           // дыры по размеру: 1..40, корзина 41 = больше 40
+// Дыры. Позиции и длины укладываются в int: интерактор ограничивает траншею 1e8 м.
+//   hLen[s] - длина дыры, начинающейся в s (0 - дыры нет);
+//   hBeg[e] - начало+1 дыры, кончающейся в e (0 - дыры нет);
+//   ba[k]   - начала дыр длины k (1..40), ba[41] - начала дыр длиннее 40;
+//   big     - дыры длиннее 40, упорядоченные по (длина, начало).
+static vector<int> hLen, hBeg;
+static set<int> ba[SM + 2];
+static set<pair<int,int>> big;
 
 static inline int bk(ll l) { return (int)(l < SM + 1 ? l : SM + 1); }
-
+static inline void ensurePos(ll p) {
+    if ((ll)hLen.size() <= p) { size_t n = (size_t)p + 1; if (n < 2 * hLen.size()) n = 2 * hLen.size(); hLen.resize(n, 0); hBeg.resize(n, 0); }
+}
 static inline void addRaw(ll s, ll len) {
     if (len <= 0) return;
-    fa[s] = len; fe[s+len] = s;
-    bySize.insert({len, s}); ba[bk(len)].insert(s);
+    ensurePos(s + len);
+    hLen[s] = (int)len; hBeg[s + len] = (int)s + 1;
+    ba[bk(len)].insert((int)s);
+    if (len > SM) big.insert({(int)len, (int)s});
 }
 static inline void delRaw(ll s, ll len) {
-    fa.erase(s); fe.erase(s+len);
-    bySize.erase({len, s}); ba[bk(len)].erase(s);
+    hLen[s] = 0; hBeg[s + len] = 0;
+    ba[bk(len)].erase((int)s);
+    if (len > SM) big.erase({(int)len, (int)s});
 }
+static inline ll holeEndingAt(ll e) { return e < (ll)hBeg.size() && hBeg[e] ? hBeg[e] - 1 : -1; }
 static void addFree(ll s, ll len) {           // освободить участок со склейкой соседей
-    auto a = fe.find(s);
-    if (a != fe.end()) { ll ps = a->second, pl = s - ps; delRaw(ps, pl); s = ps; len += pl; }
-    auto b = fa.find(s + len);
-    if (b != fa.end()) { ll nl = b->second; delRaw(s + len, nl); len += nl; }
+    ll ps = holeEndingAt(s);
+    if (ps >= 0) { ll pl = s - ps; delRaw(ps, pl); s = ps; len += pl; }
+    if (s + len < (ll)hLen.size() && hLen[s + len]) { ll nl = hLen[s + len]; delRaw(s + len, nl); len += nl; }
     addRaw(s, len);
 }
 
-static bool rightFit(ll L, ll& hs, ll& hl);
+static bool leftFit(ll L, ll& hs, ll& hl) {   // самая левая подходящая дыра
+    ll b = LLONG_MAX; int bl = -1;
+    for (int k = (int)L; k <= SM + 1; k++)
+        if (!ba[k].empty() && *ba[k].begin() < b) { b = *ba[k].begin(); bl = k; }
+    if (bl < 0) return false;
+    hs = b; hl = hLen[b]; return true;
+}
+static bool rightFit(ll L, ll& hs, ll& hl) {  // самая правая подходящая дыра
+    ll b = -1; int bl = -1;
+    for (int k = (int)L; k <= SM + 1; k++)
+        if (!ba[k].empty() && *ba[k].rbegin() > b) { b = *ba[k].rbegin(); bl = k; }
+    if (bl < 0) return false;
+    hs = b; hl = hLen[b]; return true;
+}
 
-// ---- Вероятность удаления по длине трубы (выучивается по ходу теста).
-// hz(L) = доля удалённых среди уложенных труб длины L (со сглаживанием).
-// HZ_ORIENT: остаток дыры прижимаем к соседу с большей вероятностью удаления - когда он уйдёт,
-//            остаток сольётся с его дырой, а не останется мёртвым.
-// HZ_PICK = K: среди равных по размеру дыр (первые K в корзине) берём ту, где у трубы
-//            соседи с похожей судьбой: умирающие рядом с умирающими - их дыры потом сольются.
-#ifndef HZ_ORIENT
-#define HZ_ORIENT 0
-#endif
-#ifndef HZ_PICK
-#define HZ_PICK 0
-#endif
-#ifndef HZ_DECAY
-#define HZ_DECAY 0   // 0 - накопленная статистика; иначе полураспад в числе труб (подстройка под смену фаз)
-#endif
-#define HZ_ON (HZ_ORIENT || HZ_PICK)
-static unordered_map<ll,int> startId, endId;   // труба по началу / по концу
-static vector<int> pLen;                        // длина трубы по номеру
-static double plC[SM+2], remC[SM+2];
-static inline double hzL(int L) { return (remC[L] + 1.0) / (plC[L] + 2.0); }
-static inline double hzLeft(ll s) {             // левый сосед дыры, начинающейся в s (0 - начало траншеи, «стена»)
-    auto a = endId.find(s); return a == endId.end() ? 0.0 : hzL(pLen[a->second]);
-}
-static inline double hzRight(ll e) {            // правый сосед; нет соседа - конец траншеи, туда всё растёт
-    auto b = startId.find(e); return b == startId.end() ? 1.0 : hzL(pLen[b->second]);
-}
-static inline double same(double x, double y) { return x * y + (1 - x) * (1 - y); }
-static double holeScore(ll s, ll len, ll L) {
-    double hA = hzLeft(s), hB = hzRight(s + len), hN = hzL((int)L);
-    if (len == L) return same(hN, hA) + same(hN, hB);
-    double hY = hA > hB ? hA : hB, hX = hA > hB ? hB : hA;   // остаток - к более «смертному» соседу
-    return same(hN, hX) + 1 - (1 - hN) * (1 - hY);
-}
-static ll bestInBucket(int k, ll L, ll ban) {   // лучшая по holeScore из первых HZ_PICK дыр корзины
-    ll best = -1; double bs = -1; int seen = 0;
-    for (auto it = ba[k].begin(); it != ba[k].end() && seen < (HZ_PICK > 0 ? HZ_PICK : 1); ++it) {
-        if (*it == ban) continue;
-        seen++;
-        double sc = HZ_PICK > 0 ? holeScore(*it, k, L) : 0;
-        if (sc > bs + 1e-12) { bs = sc; best = *it; }
+// Первая непустая корзина размеров [lo, hi] (по возрастанию), минуя дыру ban; из равных по
+// размеру берём левую. Дыры длиннее 40 перебираем по возрастанию длины.
+static bool firstBucket(ll lo, ll hi, ll ban, ll& hs, ll& hl) {
+    for (ll k = lo; k <= hi && k <= SM; k++) {
+        if (ba[k].empty()) continue;
+        auto it = ba[k].begin();
+        if (*it == ban && ++it == ba[k].end()) continue;
+        hs = *it; hl = k; return true;
     }
-    return best;
-}
-
-// best-fit с порогом остатка, минуя дыру с началом ban
-static bool pickExcept(ll L, ll ban, ll& hs, ll& hl) {   // best-fit с порогом, минуя дыру ban
-    for (int pass = 0; pass < 2; pass++) {
-        ll from = pass == 0 ? L + KMIN : L;
-        for (auto it = bySize.lower_bound({from, LLONG_MIN}); it != bySize.end(); ++it) {
+    if (hi > SM) {
+        for (auto it = big.begin(); it != big.end(); ++it) {
             if (it->second == ban) continue;
             hl = it->first; hs = it->second; return true;
         }
@@ -197,53 +140,23 @@ static bool pickExcept(ll L, ll ban, ll& hs, ll& hl) {   // best-fit с поро
 // оказалась самой правой, её лучше поберечь. Дыры у конца траншеи чаще сливаются с
 // соседними при удалениях, и занимать их, когда есть альтернатива, — значит терять
 // будущий большой свободный участок.
-// первая непустая корзина размеров [lo, hi] (по возрастанию); корзина 41 - любые дыры больше 40
-static bool firstBucket(ll L, ll lo, ll hi, ll ban, ll& hs, ll& hl) {
-    for (ll k = lo; k <= hi && k <= SM; k++) {
-        if (ba[k].empty()) continue;
-        if (ba[k].size() == 1 && *ba[k].begin() == ban) continue;
-        ll st = bestInBucket((int)k, L, ban);            // без HZ_PICK - самая левая
-        hs = st; hl = k; return true;
-    }
-    if (hi > SM) {
-        for (auto it = bySize.lower_bound({SM + 1, LLONG_MIN}); it != bySize.end(); ++it) {
-            if (it->second == ban) continue;
-            hl = it->first; hs = it->second; return true;
-        }
-    }
-    return false;
-}
 static bool goodFit(ll L, ll& hs, ll& hl) {
-    ll rs, rl;
-    bool anyRight = rightFit(L, rs, rl);                  // самая правая подходящая дыра
     ll ban = -1;
     if (!ba[(int)L].empty()) {                            // есть точное совпадение
         ll es = *ba[(int)L].begin();
-        if (trenchLen > GUARD) { hs = bestInBucket((int)L, L, -1); hl = L; return true; }
-        if (!anyRight || es != rs) { hs = es; hl = L; return true; }
+        if (trenchLen > GUARD) { hs = es; hl = L; return true; }
+        ll rs, rl;
+        if (!rightFit(L, rs, rl) || es != rs) { hs = es; hl = L; return true; }
         ban = es;                                         // точная дыра самая правая - поищем другую
     }
-    if (firstBucket(L, L + KMIN, LLONG_MAX, ban, hs, hl)) return true;
-    if (firstBucket(L, L, L + KMIN - 1, ban, hs, hl)) return true;
+    if (firstBucket(L + KMIN, LLONG_MAX, ban, hs, hl)) return true;
+    if (firstBucket(L, L + KMIN - 1, ban, hs, hl)) return true;
     if (ban >= 0) { hs = ban; hl = L; return true; }
     return false;
 }
-static bool leftFit(ll L, ll& hs, ll& hl) {   // самая левая подходящая дыра
-    ll b = LLONG_MAX; int bl = -1;
-    for (int k = (int)L; k <= SM + 1; k++)
-        if (!ba[k].empty() && *ba[k].begin() < b) { b = *ba[k].begin(); bl = k; }
-    if (bl < 0) return false;
-    hs = b; hl = fa[b]; return true;
-}
-static bool rightFit(ll L, ll& hs, ll& hl) {  // самая правая подходящая дыра
-    ll b = -1; int bl = -1;
-    for (int k = (int)L; k <= SM + 1; k++)
-        if (!ba[k].empty() && *ba[k].rbegin() > b) { b = *ba[k].rbegin(); bl = k; }
-    if (bl < 0) return false;
-    hs = b; hl = fa[b]; return true;
-}
 
-// Наименьший период p (2..PRIOR_MAX_PERIOD), которому подчиняются последние 3p длин, при условии что в периоде есть разные длины.
+// Наименьший период p (PRIOR_MIN_PERIOD..PRIOR_MAX_PERIOD), которому подчиняются последние PRIOR_REPS*p длин,
+// при условии что в периоде есть разные длины.
 static int detectPeriod(const vector<int>& v) {
     int n = (int)v.size();
     for (int p = PRIOR_MIN_PERIOD; p <= PRIOR_MAX_PERIOD; p++) {
@@ -265,6 +178,22 @@ static inline int readInt() {
     int v = 0; while (c >= '0' && c <= '9') { v = v * 10 + (c - '0'); c = GETC(); }
     return v * sg;
 }
+// Ответ интерактору: числа через пробел и перевод строки, сразу со сбросом буфера
+// (протокол пошаговый: следующую команду интерактор пришлёт только после ответа).
+static inline char* putNum(char* p, ll v) {
+    char t[24]; int n = 0;
+    do { t[n++] = (char)('0' + v % 10); v /= 10; } while (v);
+    while (n) *p++ = t[--n];
+    return p;
+}
+static inline void answer2(ll a, ll b) {
+    char buf[48], *p = putNum(buf, a); *p++ = ' '; p = putNum(p, b); *p++ = '\n';
+    fwrite(buf, 1, (size_t)(p - buf), stdout); fflush(stdout);
+}
+static inline void answer1(ll a) {
+    char buf[24], *p = putNum(buf, a); *p++ = '\n';
+    fwrite(buf, 1, (size_t)(p - buf), stdout); fflush(stdout);
+}
 
 int main() {
     ll& trench = trenchLen;
@@ -272,24 +201,21 @@ int main() {
 #ifdef SIM   // локальный режим: тест читается из stdin без интерактора (заголовок "вес n" пропускаем)
     { double w; int n; if (scanf("%lf %d", &w, &n) != 2) return 1; }
 #endif
+    hLen.resize(1 << 16, 0); hBeg.resize(1 << 16, 0);
     vector<pair<ll,ll>> pipes;  pipes.reserve(200005);  pipes.push_back({-1,-1});
-#if HZ_ON
-    pLen.reserve(200005); pLen.push_back(0); startId.reserve(1 << 18); endId.reserve(1 << 18);
-#endif
     vector<int> runIdx;         runIdx.reserve(200005); runIdx.push_back(-1);
     vector<int> runId;          runId.reserve(200005);  runId.push_back(-1);
 
     int curSize = -1, curRun = 0, curCount = 0;
-    vector<int> runLens;                       // длины укладок после последнего удаления (для поиска периода)
-    vector<signed char> predDoom;              // предсказание судьбы трубы: -1 нет, 0 останется, 1 удалят
+    vector<int> runLens;                       // длины укладок после последнего удаления (для режима 3)
+    vector<signed char> predDoom;              // предсказание режима 3: -1 нет, 0 останется, 1 удалят
     predDoom.reserve(200005); predDoom.push_back(-1);
     ll priorHit = 0, priorMiss = 0; bool priorBad = false;
     vector<int> remIdx;                        // позиции удалённых труб текущей пачки
     bool havePattern = false, expTrusted = false;
     int patPeriod = 2, patMask = 0, patRunLen = 0, patRunLenPrev = 0, expLen = 0;   // шаблон: удаляются позиции i, у которых (patMask >> (i % patPeriod)) & 1
-    int remBurst = 0;
-    // Режим 4 (выученная судьба позиций периода): период ищется по ВСЕМ укладкам (удаления не сбрасывают).
-    // Каждую трубу «судим» через L4_H укладок: удалили её за это время - позиция периода обречённая.
+    int remBurst = 0;                          // удалений подряд после последней укладки
+    // Режим 4: период по всем укладкам; судьба трубы известна через L4_H укладок.
     vector<int> allLens; allLens.reserve(200005);
     vector<signed char> lpPer, lpRes, lpPred;
     lpPer.reserve(200005); lpRes.reserve(200005); lpPred.reserve(200005);
@@ -304,7 +230,7 @@ int main() {
         if (cmd > 0) {
             ll L = cmd;
 
-            bool burst = SPLIT_RUNS && curCount >= MIN_RUN && remBurst >= 5 && remBurst * 8 >= curCount;
+            bool burst = curCount >= MIN_RUN && remBurst >= 5 && remBurst * 8 >= curCount;
             remBurst = 0;
             if ((int)L != curSize || burst) {  // пачка сменилась (или закончилась всплеском удалений): анализируем предыдущую
                 if (curSize >= 0 && curCount >= MIN_RUN && !remIdx.empty()) {
@@ -337,23 +263,17 @@ int main() {
 
             if (++laid == SWITCH_AT) KMIN = KMIN1;
             int idx = curCount++;
-#ifdef NOPHASE
-            havePattern = false;
-#endif
-            bool phase  = havePattern && patRunLen >= MIN_RUN;
+            bool phase  = havePattern && patRunLen >= MIN_RUN;          // режим 2
             bool doomed = phase && (((patMask >> (idx % patPeriod)) & 1) != 0);
-            bool prior = false;                // решение принято по предположению, а не по выученному шаблону
+            bool prior = false;                // режим 3: решение по предположению
+            bool learned = false;              // режим 4: решение по выученной судьбе позиций периода
             runLens.push_back((int)L);
-#ifdef NOPHASE
-            priorBad = true;
-#endif
-            bool learned = false;              // решение по выученной судьбе позиций периода
+
             int lper = 0, lres = 0;
-            ll l4dig = 0;                      // сколько метров «обречённых» труб ещё придёт в этом периоде
-#if LEARN_FATE
+            ll l4dig = 0;                      // сколько метров обречённых труб придёт за период начиная с текущей
             allLens.push_back((int)L);
-            {   // судим трубу, уложенную H укладок назад: удалили её за это время или нет
-                ll id = (ll)pipes.size() - L4_H;   // номер трубы, у которой истёк срок наблюдения
+            {   // судим трубу, уложенную L4_H укладок назад: удалили её за это время или нет
+                ll id = (ll)pipes.size() - L4_H;
                 if (id >= 1 && lpPer[id] > 0) {
                     bool died = pipes[id].first < 0;
                     (died ? jDoom : jKeep)[lpPer[id]][lpRes[id]]++;
@@ -367,8 +287,8 @@ int main() {
             if (lper > 0) {
                 lres = (int)((allLens.size() - 1) % lper);
                 if (!phase && !l4Bad && perStable >= 2 * lper) {
-                    // верим, если каждая позиция периода уже оценена >= 2 раз и почти всегда удаляется
-                    // либо почти никогда (>= 90% / <= 10%), и обречённые позиции вообще есть
+                    // верим, если каждая позиция периода уже оценена >= 2 раз и удаляется либо почти
+                    // всегда, либо почти никогда, и обречённые позиции вообще есть
                     bool pure = true, any = false;
                     for (int r = 0; r < lper && pure; r++) {
                         ll n = jDoom[lper][r] + jKeep[lper][r];
@@ -380,7 +300,7 @@ int main() {
                         learned = true; phase = true;
                         ll n = jDoom[lper][lres] + jKeep[lper][lres];
                         doomed = jDoom[lper][lres] * 2 >= n;
-                        for (int j = 0; j < lper; j++) {        // обречённые метры до конца текущего периода
+                        for (int j = 0; j < lper; j++) {
                             int r = (lres + j) % lper;
                             ll nn = jDoom[lper][r] + jKeep[lper][r];
                             if (jDoom[lper][r] * 2 >= nn) l4dig += allLens[allLens.size() - 1 + j - lper];
@@ -388,83 +308,59 @@ int main() {
                     }
                 }
             }
-#endif
             if (!phase && !priorBad) {
-#if PRIOR_PERIODIC
                 int per = detectPeriod(runLens);
                 if (per > 0) {
                     int res = (int)(runLens.size() - 1) % per;
                     phase = true; prior = true;
                     doomed = (res % 2 == 0) && !(per % 2 == 1 && res == per - 1);
                 }
-#endif
             }
 
             ll hs = -1, hl = -1, D, dig = 0;
             bool got;
-            if (learned && !doomed && L4_KEPT == 3 && !ba[(int)L].empty()) { hs = *ba[(int)L].begin(); hl = L; got = true; }
-            else if (learned && !doomed && L4_KEPT >= 2) got = false;        // остающиеся - в хвост траншеи: плотный рост
-            else if (learned && !doomed && L4_KEPT == 1) got = goodFit(L, hs, hl);   // остающиеся - обычным best-fit
-            else if (learned && doomed && L4_DOOM == 1) got = goodFit(L, hs, hl);    // обречённые переиспользуют дыры
-            else if (learned && doomed && L4_EXACT && !ba[(int)L].empty()) {   // обречённая - в дыру точно по размеру:
-                hs = *ba[(int)L].rbegin(); hl = L; got = true;                 // скорее всего, это место прошлой обречённой
+            if (learned && !doomed) {          // режим 4, остающаяся: точная дыра, иначе хвост траншеи
+                got = !ba[(int)L].empty();
+                if (got) { hs = *ba[(int)L].begin(); hl = L; }
             }
-            else got = !phase ? goodFit(L, hs, hl)
-                              : (doomed ? rightFit(L, hs, hl) : leftFit(L, hs, hl));
+            else if (learned) got = goodFit(L, hs, hl);   // режим 4, обречённая: переиспользует дыры
+            else if (!phase) got = goodFit(L, hs, hl);
+            else got = doomed ? rightFit(L, hs, hl) : leftFit(L, hs, hl);
             if (got) {
                 delRaw(hs, hl);
-                bool toRight = doomed && !(learned && L4_DOOM == 1 && !L4_DRIGHT);
-#if HZ_ORIENT
-                if (!phase && hl > L) toRight = hzLeft(hs) > hzRight(hs + hl);
-#endif
-                if (!toRight) { D = hs;           if (hl > L) addRaw(hs + L, hl - L); }
-                else         { D = hs + hl - L;   if (hl > L) addRaw(hs, hl - L); }
+                if (!doomed || learned) { D = hs;           if (hl > L) addRaw(hs + L, hl - L); }
+                else                    { D = hs + hl - L;  if (hl > L) addRaw(hs, hl - L); }
             } else {
                 ll ts = trench, tl = 0;
-                auto e = fe.find(trench);
-                if (e != fe.end()) { ts = e->second; tl = trench - ts; delRaw(ts, tl); }
+                ll e = holeEndingAt(trench);
+                if (e >= 0) { ts = e; tl = trench - ts; delRaw(ts, tl); }
                 ll need = L - tl;
-                if (learned && doomed && L4_DIG && l4dig - tl > need) need = l4dig - tl;   // место под все обречённые трубы периода
-                if (phase && !prior && !learned) {   // копаем сразу на остаток пачки
+                if (learned && doomed && l4dig - tl > need) need = l4dig - tl;   // место под все обречённые трубы периода
+                if (phase && !prior && !learned) {   // режим 2: копаем сразу на остаток пачки
                     ll rest = (ll)(expLen - idx) * L - tl;
-#if CAP_MULT > 0   // пока прогноз длины пачки не подтвердился, не копаем вперёд больше CAP_MULT x уже уложенного в пачке
-                    ll cap = (ll)CAP_MULT * (ll)idx * L + 40;
+                    ll cap = CAP_MULT * (ll)idx * L + 40;
                     if (!expTrusted && rest > cap) rest = cap;
-#endif
                     if (rest > need) need = rest;
                 }
-                dig = (need + 19) / 20;
+                dig = need > 0 ? (need + 19) / 20 : 0;   // хвост может быть уже длиннее нужного (режим 4)
                 trench += 20 * dig;
                 ll nl = tl + 20 * dig;
                 if (!doomed) { D = ts;             if (nl > L) addRaw(ts + L, nl - L); }
                 else         { D = ts + nl - L;    if (nl > L) addRaw(ts, nl - L); }
             }
 
-#if HZ_ON
-            startId[D] = (int)pipes.size(); endId[D + L] = (int)pipes.size(); pLen.push_back((int)L);
-#if HZ_DECAY
-            { double f = pow(0.5, 1.0 / HZ_DECAY); for (int v = 1; v <= SM; v++) { plC[v] *= f; remC[v] *= f; } }
-#endif
-            plC[L] += 1;
-#endif
             pipes.push_back({D, L}); runIdx.push_back(idx); runId.push_back(curRun);
             predDoom.push_back(prior ? (doomed ? 1 : 0) : -1);
             lpPer.push_back((signed char)lper); lpRes.push_back((signed char)lres);
             lpPred.push_back(learned ? (doomed ? 1 : 0) : -1);
-            printf("%lld %lld\n", dig, D);
-            fflush(stdout);
+            answer2(dig, D);
         } else {
             ll k = -cmd;
-            printf("%lld\n", pipes[k].first);
-            fflush(stdout);
+            answer1(pipes[k].first);
             addFree(pipes[k].first, pipes[k].second);
-#if HZ_ON
-            startId.erase(pipes[k].first); endId.erase(pipes[k].first + pipes[k].second);
-            remC[pipes[k].second] += 1;
-#endif
             if (runId[k] == curRun) remIdx.push_back(runIdx[k]);
             remBurst++;
-            if (predDoom[k] >= 0) {                   // сверяем предположение с реальностью
+            if (predDoom[k] >= 0) {                   // сверяем предположение режима 3 с реальностью
                 if (predDoom[k] == 1) priorHit++; else priorMiss++;
                 if (priorHit + priorMiss >= 50 && priorMiss > priorHit) priorBad = true;
             }
@@ -474,7 +370,6 @@ int main() {
     }
 #ifdef SIM
     { ll alive = 0; for (size_t i = 1; i < pipes.size(); i++) if (pipes[i].first >= 0) alive += pipes[i].second;
-      fprintf(stderr, "L4 hit %lld miss %lld bad %d\n", l4Hit, l4Miss, (int)l4Bad);
       fprintf(stderr, "RATIO %.6f alive %lld trench %lld\n", (double)alive / (double)trench, alive, trench); }
 #endif
     return 0;

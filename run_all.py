@@ -3,7 +3,7 @@
 
 Usage: python run_all.py [solution] [-d DIR ...] [--timeout SEC] [-o kpi_results]
 Defaults: compiles solution.cpp with g++ -O2 (pass a binary to skip), test dirs: tests myTests.
-Writes <out>.csv (per test) and <out>.json (summary with total KPI).
+Writes <out>.csv (per test, incl. solution CPU time) and <out>.json (summary with total KPI).
 """
 import argparse
 import csv
@@ -30,6 +30,34 @@ def read_weight(test_file):
         return float(f.readline().split()[0])
 
 
+def cpu_seconds_windows(proc):
+    """User+kernel CPU time of a finished process (Windows; handle is still open until Popen is freed)."""
+    import ctypes
+    from ctypes import wintypes
+    ft = [wintypes.FILETIME() for _ in range(4)]
+    ok = ctypes.windll.kernel32.GetProcessTimes(wintypes.HANDLE(int(proc._handle)), *[ctypes.byref(x) for x in ft])
+    if not ok:
+        return None
+    val = lambda f: ((f.dwHighDateTime << 32) | f.dwLowDateTime) / 1e7
+    return val(ft[2]) + val(ft[3])
+
+
+def wait_with_cpu(proc, timeout):
+    """Waits for proc; returns its CPU time in seconds (None if unknown). Raises TimeoutExpired."""
+    if os.name == "nt":
+        proc.wait(timeout=timeout)
+        return cpu_seconds_windows(proc)
+    deadline = time.time() + timeout
+    while True:   # os.wait4 reaps the child and reports its own rusage
+        pid, status, ru = os.wait4(proc.pid, os.WNOHANG)
+        if pid:
+            proc.returncode = os.waitstatus_to_exitcode(status)
+            return ru.ru_utime + ru.ru_stime
+        if time.time() > deadline:
+            raise subprocess.TimeoutExpired(proc.args, timeout)
+        time.sleep(0.005)
+
+
 def run_one(solution, interactor, test_file, timeout):
     """Runs in a scratch cwd because the interactor always writes ./score.txt."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -37,6 +65,7 @@ def run_one(solution, interactor, test_file, timeout):
         open(answer, "w").close()
         start = time.time()
         status = "ok"
+        cpu = None
         inter = subprocess.Popen(
             [interactor, test_file, "score.txt", answer, "report.txt"],
             cwd=tmp, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -45,7 +74,7 @@ def run_one(solution, interactor, test_file, timeout):
                                stderr=subprocess.DEVNULL)
         inter.stdout.close()  # parent must not hold pipe ends, or EOF never arrives
         try:
-            sol.wait(timeout=timeout)
+            cpu = wait_with_cpu(sol, timeout)
             inter.stdin.close()
             inter.wait(timeout=10)
         except subprocess.TimeoutExpired:
@@ -65,7 +94,7 @@ def run_one(solution, interactor, test_file, timeout):
         except (OSError, ValueError):
             if status == "ok":
                 status = "no_score"  # interactor rejected the output / crash
-        return score, elapsed, status
+        return score, elapsed, cpu, status
 
 
 def main():
@@ -108,20 +137,26 @@ def main():
 
     rows = []
     total = total_weight = 0.0
+    cpu_total = cpu_max = 0.0
     for t in tests:
         weight = read_weight(t)
-        score, elapsed, status = run_one(solution, interactor, t, args.timeout)
+        score, elapsed, cpu, status = run_one(solution, interactor, t, args.timeout)
+        cpu_total += cpu or 0.0
+        cpu_max = max(cpu_max, cpu or 0.0)
         total += score
         total_weight += weight
         label = os.path.join(os.path.basename(os.path.dirname(t)), os.path.basename(t))
-        rows.append([label, weight, f"{score:.9f}", f"{score / weight:.6f}", f"{elapsed:.2f}", status])
+        cpu_s = "?" if cpu is None else f"{cpu:.3f}"
+        rows.append([label, weight, f"{score:.9f}", f"{score / weight:.6f}", f"{elapsed:.2f}", cpu_s, status])
         print(f"{label:<14} w={weight:<5g} score={score:.6f} ratio={score / weight:.4f} "
-              f"time={elapsed:.2f}s {status}", flush=True)
+              f"time={elapsed:.2f}s cpu={cpu_s}s {status}", flush=True)
 
     kpi = {
         "solution": solution,
         "tests": len(rows),
-        "failed": sum(r[5] != "ok" for r in rows),
+        "failed": sum(r[6] != "ok" for r in rows),
+        "solution_cpu_total_s": round(cpu_total, 3),
+        "solution_cpu_max_s": round(cpu_max, 3),
         "total_score": total,
         "max_possible": total_weight,
         "kpi": total / total_weight if total_weight else 0.0,
@@ -129,11 +164,12 @@ def main():
     }
     with open(args.out + ".csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["test", "weight", "score", "ratio", "time_s", "status"])
+        w.writerow(["test", "weight", "score", "ratio", "time_s", "cpu_s", "status"])
         w.writerows(rows)
     with open(args.out + ".json", "w") as f:
         json.dump(kpi, f, indent=2)
     print(f"\nTotal score: {total:.6f} / {total_weight:g}  (KPI = {kpi['kpi']:.6f}, failed: {kpi['failed']})")
+    print(f"Solution CPU: total {cpu_total:.2f}s, max per test {cpu_max:.3f}s")
     print(f"Saved: {args.out}.csv, {args.out}.json")
 
 
