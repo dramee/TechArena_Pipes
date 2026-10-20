@@ -27,7 +27,9 @@
 //   удалят позиции с чётным номером внутри периода (так устроены открытые адверсарные тесты). Предполагаемые
 //   к удалению трубы кладём вплотную к правому краю, остальные к левому, чтобы после удаления освободились
 //   большие непрерывные блоки. Предположение проверяется по реальным удалениям и отключается навсегда,
-//   если оно оказывается неверным чаще, чем верным.
+//   если оно оказывается неверным чаще, чем верным. Удалений может не быть вовсе, поэтому режим не берёт
+//   дыры, после которых остаётся щель, не набираемая суммой встреченных длин, и не оставляет у конца
+//   траншеи слева от трубы щель короче самой короткой трубы.
 //
 // Режим 4 (выученная судьба позиций периода): период ищется по всем укладкам подряд
 //   (удаления его не сбрасывают). Каждую трубу «судим» через L4_H укладок: удалили её за это время
@@ -115,17 +117,32 @@ static void addFree(ll s, ll len) {           // освободить участ
     addRaw(s, len);
 }
 
-static bool leftFit(ll L, ll& hs, ll& hl) {   // самая левая подходящая дыра
+// Мёртвый остаток: длину r <= 40 нельзя набрать суммой встреченных длин труб, значит щель
+// длины r внутри траншеи не заполнится никогда. fillable[r] пересчитывается при появлении новой длины.
+static bool seenLen[SM + 1], fillable[SM + 1];
+static void noteLen(int L) {
+    if (seenLen[L]) return;
+    seenLen[L] = true;
+    fillable[0] = true;
+    for (int r = 1; r <= SM; r++) {
+        fillable[r] = false;
+        for (int v = 1; v <= r && !fillable[r]; v++) if (seenLen[v] && fillable[r - v]) fillable[r] = true;
+    }
+}
+static inline bool deadRest(int k, ll L, bool skipDead) {   // дыра длины k оставила бы мёртвый остаток
+    return skipDead && k <= SM && k != L && !fillable[k - L];
+}
+static bool leftFit(ll L, ll& hs, ll& hl, bool skipDead = false) {   // самая левая подходящая дыра
     ll b = LLONG_MAX; int bl = -1;
     for (int k = (int)L; k <= SM + 1; k++)
-        if (!ba[k].empty() && *ba[k].begin() < b) { b = *ba[k].begin(); bl = k; }
+        if (!ba[k].empty() && !deadRest(k, L, skipDead) && *ba[k].begin() < b) { b = *ba[k].begin(); bl = k; }
     if (bl < 0) return false;
     hs = b; hl = hLen(b); return true;
 }
-static bool rightFit(ll L, ll& hs, ll& hl) {  // самая правая подходящая дыра
+static bool rightFit(ll L, ll& hs, ll& hl, bool skipDead = false) {  // самая правая подходящая дыра
     ll b = -1; int bl = -1;
     for (int k = (int)L; k <= SM + 1; k++)
-        if (!ba[k].empty() && *ba[k].rbegin() > b) { b = *ba[k].rbegin(); bl = k; }
+        if (!ba[k].empty() && !deadRest(k, L, skipDead) && *ba[k].rbegin() > b) { b = *ba[k].rbegin(); bl = k; }
     if (bl < 0) return false;
     hs = b; hl = hLen(b); return true;
 }
@@ -226,6 +243,7 @@ int main() {
     bool havePattern = false, expTrusted = false;
     int patPeriod = 2, patMask = 0, patRunLen = 0, patRunLenPrev = 0, expLen = 0;   // шаблон: удаляются позиции i, у которых (patMask >> (i % patPeriod)) & 1
     int remBurst = 0;                          // удалений подряд после последней укладки
+    int minLen = SM + 1;                       // самая короткая встреченная труба
     // Режим 4: период по всем укладкам; судьба трубы известна через L4_H укладок.
     vector<int> allLens; allLens.reserve(200005);
     vector<signed char> lpPer, lpRes, lpPred;
@@ -273,6 +291,8 @@ int main() {
             }
 
             if (++laid == SWITCH_AT) KMIN = KMIN1;
+            if (L < minLen) minLen = (int)L;
+            noteLen((int)L);
             int idx = curCount++;
             bool phase  = havePattern && patRunLen >= MIN_RUN;          // режим 2
             bool doomed = phase && (((patMask >> (idx % patPeriod)) & 1) != 0);
@@ -336,11 +356,16 @@ int main() {
             }
             else if (learned) got = goodFit(L, hs, hl);   // режим 4, обречённая: переиспользует дыры
             else if (!phase) got = goodFit(L, hs, hl);
-            else got = doomed ? rightFit(L, hs, hl) : leftFit(L, hs, hl);
+            else   // режим 3 (удалений может не быть вовсе): не оставлять щелей, которые нечем заполнить
+                got = doomed ? rightFit(L, hs, hl, prior) : leftFit(L, hs, hl, prior);
             if (got) {
                 delRaw(hs, hl);
-                if (!doomed || learned) { D = hs;           if (hl > L) addRaw(hs + L, hl - L); }
-                else                    { D = hs + hl - L;  if (hl > L) addRaw(hs, hl - L); }
+                // Обречённую кладём к правому краю, но не в хвостовую дыру, если слева осталась бы щель
+                // короче любой встреченной трубы: такая щель внутри траншеи не заполнится никогда,
+                // а у конца траншеи этот остаток просто войдёт в следующую копку.
+                bool right = doomed && !learned && !(prior && hs + hl == trench && hl - L > 0 && hl - L < minLen);
+                if (!right) { D = hs;           if (hl > L) addRaw(hs + L, hl - L); }
+                else        { D = hs + hl - L;  if (hl > L) addRaw(hs, hl - L); }
             } else {
                 ll ts = trench, tl = 0;
                 ll e = holeEndingAt(trench);
@@ -356,8 +381,9 @@ int main() {
                 dig = need > 0 ? (need + 19) / 20 : 0;   // хвост может быть уже длиннее нужного (режим 4)
                 trench += 20 * dig;
                 ll nl = tl + 20 * dig;
-                if (!doomed) { D = ts;             if (nl > L) addRaw(ts + L, nl - L); }
-                else         { D = ts + nl - L;    if (nl > L) addRaw(ts, nl - L); }
+                bool right = doomed && !(prior && nl - L > 0 && nl - L < minLen);   // то же для свежей копки
+                if (!right) { D = ts;             if (nl > L) addRaw(ts + L, nl - L); }
+                else        { D = ts + nl - L;    if (nl > L) addRaw(ts, nl - L); }
             }
 
             pipes.push_back({D, L}); runIdx.push_back(idx); runId.push_back(curRun);
