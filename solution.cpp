@@ -27,7 +27,9 @@
 //   удалят позиции с чётным номером внутри периода (так устроены открытые адверсарные тесты). Предполагаемые
 //   к удалению трубы кладём вплотную к правому краю, остальные к левому, чтобы после удаления освободились
 //   большие непрерывные блоки. Предположение проверяется по реальным удалениям и отключается навсегда,
-//   если оно оказывается неверным чаще, чем верным. Удалений может не быть вовсе, поэтому режим не берёт
+//   если оно оказывается неверным чаще, чем верным. Так же угадывается шаблон длинной пачки одинаковых
+//   труб, пока режим 2 его ещё не выучил: начиная с RUN_GUESS-й трубы «удалят каждую вторую».
+//   Удалений может не быть вовсе, поэтому режим не берёт
 //   дыры, после которых остаётся щель, не набираемая суммой встреченных длин, и не оставляет у конца
 //   траншеи слева от трубы щель короче самой короткой трубы.
 //
@@ -41,16 +43,30 @@
 //   Главное - остающиеся не занимают и не дробят дыры, которые освобождают обречённые.
 //   Если прогнозы ошибаются чаще чем в 20% случаев, режим выключается навсегда.
 //
+// Прямой поиск (длинные тесты, после RO_FROM укладок): если best-fit оставил бы мёртвый остаток
+//   (его нельзя набрать длинами из недавнего потока), сравниваем три варианта - выбор best-fit, лучшую
+//   дыру с заполнимым остатком и докопку. Каждый вариант прогоняется на RO_H будущих операций по
+//   выученной модели: доля укладок, длины недавних труб и «ранг свежести» удаляемой трубы (удаляют
+//   почти всегда недавно уложенные). Стоимость = длина траншеи + мёртвые дыры + простаивающие дыры.
+//   Изменения прогона пишутся в журнал и откатываются. Объём поиска задан только бюджетом RO_RATE
+//   симулированных операций на операцию теста, поэтому результат не зависит от скорости машины;
+//   замер времени (RO_EMERG) - лишь аварийная защита от превышения лимита.
+//
 // Сборка с -DSIM читает тест из stdin без интерактора и печатает итоговый KPI в stderr.
 #include <cstdio>
 #include <cstdlib>
 #include <climits>
+#include <ctime>
 #include <vector>
 #include <set>
 #include <utility>
 
 #if defined(_WIN32)
   #define GETC _getchar_nolock
+  #ifndef NOMINMAX
+  #define NOMINMAX
+  #endif
+  #include <windows.h>
 #else
   #define GETC getchar_unlocked
 #endif
@@ -63,13 +79,31 @@ static const int MAX_PERIOD = 8;   // максимальный период ша
 static const int PRIOR_MAX_PERIOD = 12;
 static const int PRIOR_MIN_PERIOD = 3;   // меньшие периоды слишком часто возникают случайно
 static const int PRIOR_REPS = 6;         // сколько периодов подряд должно совпасть, чтобы поверить в периодичность
-static const ll SWITCH_AT = 500;         // после скольких труб поднять порог остатка
-static const ll KMIN1 = 24;
-static const ll GUARD = 100;             // правило правой дыры работает только на коротких траншеях
+#ifndef P_SWITCH
+#define P_SWITCH 500
+#endif
+#ifndef P_KMIN0
+#define P_KMIN0 4
+#endif
+#ifndef P_KMIN1
+#define P_KMIN1 24
+#endif
+#ifndef P_GUARD
+#define P_GUARD 100
+#endif
+static const ll SWITCH_AT = P_SWITCH;    // после скольких труб поднять порог остатка
+static const ll KMIN1 = P_KMIN1;
+static const ll GUARD = P_GUARD;         // правило правой дыры работает только на коротких траншеях
 static const ll CAP_MULT = 1;            // без подтверждённого прогноза копаем вперёд не больше CAP_MULT x уложенного в пачке
 static const int L4_H = 64;              // режим 4: через сколько укладок трубу считаем оставшейся навсегда
 static const int L4_PURE = 80;           // режим 4: позиция чистая, если её удаляют в >= 80% случаев или в <= 20%
-static ll KMIN = 4;
+#ifndef RUN_GUESS_FIRST
+#define RUN_GUESS_FIRST 1        // угадывать, только пока в тесте не было удалений или режим 2 уже видел шаблон пачки
+#endif
+#ifndef RUN_GUESS
+#define RUN_GUESS 20             // с какой трубы первой пачки угадывать шаблон «удалят каждую вторую» (0 - выкл)
+#endif
+static ll KMIN = P_KMIN0;
 static ll trenchLen = 0;                 // текущая длина траншеи (нужна внутри goodFit)
 
 // Дыры. Позиции и длины укладываются в int: интерактор ограничивает траншею 1e8 м.
@@ -92,21 +126,50 @@ struct PagedArray {
     }
 };
 static PagedArray hLenA, hBegA;
-static set<int> ba[SM + 2];
-static set<pair<int,int>> big;
+// Узлы множеств берутся из пула со списком свободных: вставка/удаление без обращений к malloc
+// (дыры появляются и исчезают на каждой операции, а в прямом поиске - сотни раз на операцию).
+template <class T> struct PoolAlloc {
+    typedef T value_type;
+    PoolAlloc() {}
+    template <class U> PoolAlloc(const PoolAlloc<U>&) {}
+    static void*& freeList() { static void* f = nullptr; return f; }
+    T* allocate(size_t n) {
+        if (n != 1) return static_cast<T*>(::operator new(n * sizeof(T)));
+        void*& f = freeList();
+        if (f) { void* p = f; f = *static_cast<void**>(p); return static_cast<T*>(p); }
+        static char* blk = nullptr; static size_t left = 0;
+        const size_t sz = sizeof(T) < sizeof(void*) ? sizeof(void*) : sizeof(T);
+        if (left < sz) { blk = static_cast<char*>(::operator new(sz * 4096)); left = sz * 4096; }
+        void* p = blk; blk += sz; left -= sz; return static_cast<T*>(p);
+    }
+    void deallocate(T* p, size_t n) {
+        if (n != 1) { ::operator delete(p); return; }
+        void*& f = freeList(); *reinterpret_cast<void**>(p) = f; f = p;
+    }
+    template <class U> bool operator==(const PoolAlloc<U>&) const { return true; }
+    template <class U> bool operator!=(const PoolAlloc<U>&) const { return false; }
+};
+typedef set<int, less<int>, PoolAlloc<int>> IntSet;
+static IntSet ba[SM + 2];
+static set<pair<int,int>, less<pair<int,int>>, PoolAlloc<pair<int,int>>> big;
+static ll bigSum = 0;   // сумма длин дыр длиннее 40
 
 static inline int bk(ll l) { return (int)(l < SM + 1 ? l : SM + 1); }
 static inline ll hLen(ll s) { return hLenA.get(s); }
+static bool simOn = false;
+static vector<ll> jr;   // журнал изменений дыр во время симуляции: +start/len (добавлена) или -(start+1)/len (удалена)
 static inline void addRaw(ll s, ll len) {
     if (len <= 0) return;
+    if (simOn) { jr.push_back(s); jr.push_back(len); }
     hLenA.set(s, (int)len); hBegA.set(s + len, (int)s + 1);
     ba[bk(len)].insert((int)s);
-    if (len > SM) big.insert({(int)len, (int)s});
+    if (len > SM) { big.insert({(int)len, (int)s}); bigSum += len; }
 }
 static inline void delRaw(ll s, ll len) {
+    if (simOn) { jr.push_back(-(s + 1)); jr.push_back(len); }
     hLenA.set(s, 0); hBegA.set(s + len, 0);
     ba[bk(len)].erase((int)s);
-    if (len > SM) big.erase({(int)len, (int)s});
+    if (len > SM) { big.erase({(int)len, (int)s}); bigSum -= len; }
 }
 static inline ll holeEndingAt(ll e) { int b = hBegA.get(e); return b ? b - 1 : -1; }
 static void addFree(ll s, ll len) {           // освободить участок со склейкой соседей
@@ -129,6 +192,36 @@ static void noteLen(int L) {
         for (int v = 1; v <= r && !fillable[r]; v++) if (seenLen[v] && fillable[r - v]) fillable[r] = true;
     }
 }
+// То же по последним RW_N трубам: после смены фазы (например, короткие -> только длинные)
+// остаток, который нечем заполнить из текущего потока, становится мёртвым.
+#ifndef RW_N
+#define RW_N 2000
+#endif
+#ifndef RW_T
+#define RW_T 1     // RW_MODE 2: мёртвый остаток короче RW_T ещё допускаем, длиннее - копаем
+#endif
+#ifndef RW_MODE
+#define RW_MODE 0   // 0 - выкл; 1 - в best-fit предпочитать дыры с заполнимым остатком; 2 - и копать вместо мёртвого
+                    // остатка (на открытых тестах оба хуже; режим 2 даёт +0.007 на случайных тестах с длинными трубами)
+#endif
+static int rwCnt[SM + 1], rwBuf[RW_N]; static ll rwPos = 0; static bool rwFill[SM + 1], rwDirty = true;
+static void rwPush(int L) {
+    if (rwPos >= RW_N) { int o = rwBuf[rwPos % RW_N]; if (--rwCnt[o] == 0) rwDirty = true; }
+    rwBuf[rwPos % RW_N] = L; rwPos++;
+    if (rwCnt[L]++ == 0) rwDirty = true;
+}
+static inline bool rwFillable(ll r) {
+    if (r <= 0 || r > SM) return true;
+    if (rwDirty) {
+        rwFill[0] = true;
+        for (int x = 1; x <= SM; x++) {
+            rwFill[x] = false;
+            for (int v = 1; v <= x && !rwFill[x]; v++) if (rwCnt[v] && rwFill[x - v]) rwFill[x] = true;
+        }
+        rwDirty = false;
+    }
+    return rwFill[r];
+}
 static inline bool deadRest(int k, ll L, bool skipDead) {   // дыра длины k оставила бы мёртвый остаток
     return skipDead && k <= SM && k != L && !fillable[k - L];
 }
@@ -149,9 +242,10 @@ static bool rightFit(ll L, ll& hs, ll& hl, bool skipDead = false) {  // сама
 
 // Первая непустая корзина размеров [lo, hi] (по возрастанию), минуя дыру ban; из равных по
 // размеру берём левую. Дыры длиннее 40 перебираем по возрастанию длины.
-static bool firstBucket(ll lo, ll hi, ll ban, ll& hs, ll& hl) {
+static bool firstBucket(ll lo, ll hi, ll ban, ll& hs, ll& hl, ll L = 0) {
     for (ll k = lo; k <= hi && k <= SM; k++) {
         if (ba[k].empty()) continue;
+        if (L && !rwFillable(k - L)) continue;                // остаток нечем заполнить из текущего потока
         auto it = ba[k].begin();
         if (*it == ban && ++it == ba[k].end()) continue;
         hs = *it; hl = k; return true;
@@ -179,11 +273,16 @@ static bool goodFit(ll L, ll& hs, ll& hl) {
         ban = es;                                         // точная дыра самая правая - поищем другую
     }
     if (firstBucket(L + KMIN, LLONG_MAX, ban, hs, hl)) return true;
+    if (RW_MODE && trenchLen > GUARD && firstBucket(L, L + KMIN - 1, ban, hs, hl, L)) return true;
+    if (RW_MODE == 2 && trenchLen > GUARD && ban < 0) {   // лучше докопать, чем оставить мёртвый остаток >= RW_T
+        ll h2, l2;
+        if (firstBucket(L, L + RW_T - 1, ban, h2, l2)) { hs = h2; hl = l2; return true; }   // маленький мёртвый остаток терпим
+        return false;
+    }
     if (firstBucket(L, L + KMIN - 1, ban, hs, hl)) return true;
     if (ban >= 0) { hs = ban; hl = L; return true; }
     return false;
 }
-
 // Наименьший период p (PRIOR_MIN_PERIOD..PRIOR_MAX_PERIOD), которому подчиняются последние PRIOR_REPS*p длин,
 // при условии что в периоде есть разные длины.
 static int detectPeriod(const vector<int>& v) {
@@ -224,6 +323,168 @@ static inline void answer1(ll a) {
     fwrite(buf, 1, (size_t)(p - buf), stdout); fflush(stdout);
 }
 
+// ---- Прямой поиск (rollout). Модель будущего выучивается по ходу теста:
+//   доля укладок среди операций, длины недавних труб (окно rwBuf), «ранг свежести» удаляемой трубы
+//   (сколько живых труб уложено после неё). Кандидаты сравниваются прогоном RO_H операций с общими
+//   случайными числами; стоимость = длина траншеи + метры мёртвых дыр в конце прогона.
+#ifndef RO_H
+#define RO_H 160
+#endif
+#ifndef RO_R
+#define RO_R 1
+#endif
+#ifndef RO_ON
+#define RO_ON 1
+#endif
+static const int MAXP = 200005 + 4096;
+static int fen[MAXP + 1]; static int aliveCnt = 0;
+static inline void fenAdd(int i, int d) { aliveCnt += d; for (; i <= MAXP; i += i & -i) fen[i] += d; }
+static inline int fenPre(int i) { int r = 0; for (; i > 0; i -= i & -i) r += fen[i]; return r; }
+static int fenKth(int k) {   // наименьший индекс с префиксной суммой >= k
+    int pos = 0, lg = 1; while ((lg << 1) <= MAXP) lg <<= 1;
+    for (int b = lg; b; b >>= 1) if (pos + b <= MAXP && fen[pos + b] < k) { pos += b; k -= fen[pos]; }
+    return pos + 1;
+}
+static const int RK_N = 4000; static int rkBuf[RK_N]; static ll rkPos = 0;      // ранги недавних удалений
+static const int OP_N = 2000; static unsigned char opBuf[OP_N]; static ll opPos = 0; static int opPl = 0;
+static inline void notePlace() {
+    if (opPos >= OP_N) opPl -= opBuf[opPos % OP_N];
+    opBuf[opPos % OP_N] = 1; opPl++; opPos++;
+}
+static inline void noteRemove(int rank) {
+    if (opPos >= OP_N) opPl -= opBuf[opPos % OP_N];
+    opBuf[opPos % OP_N] = 0; opPos++;
+    rkBuf[rkPos % RK_N] = rank; rkPos++;
+}
+static vector<pair<ll,ll>>* gPipes;
+static ll simPos[4096], simLen[4096]; static int simN = 0;
+static unsigned long long rng;
+static inline unsigned rnd() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return (unsigned)(rng >> 11); }
+static void undoAll() {
+    simOn = false;
+    for (ll i = (ll)jr.size() - 2; i >= 0; i -= 2) {
+        ll a = jr[i], len = jr[i + 1];
+        if (a >= 0) delRaw(a, len); else addRaw(-a - 1, len);
+    }
+    jr.clear();
+}
+static void simPlace(ll L) {             // будущая укладка по обычному правилу
+    ll hs, hl, D;
+    if (goodFit(L, hs, hl)) { delRaw(hs, hl); D = hs; if (hl > L) addRaw(hs + L, hl - L); }
+    else {
+        ll ts = trenchLen, tl = 0; ll e = holeEndingAt(trenchLen);
+        if (e >= 0) { ts = e; tl = trenchLen - ts; delRaw(ts, tl); }
+        ll need = L - tl, dig = need > 0 ? (need + 19) / 20 : 0;
+        trenchLen += 20 * dig; ll nl = tl + 20 * dig; D = ts; if (nl > L) addRaw(ts + L, nl - L);
+    }
+    int pid = (int)gPipes->size() + simN; simPos[simN] = D; simLen[simN] = L; simN++;
+    fenAdd(pid, +1);
+}
+static vector<int> simRemoved;
+static void simRemove() {
+    if (!rkPos || aliveCnt <= 1) return;
+    int r = rkBuf[rnd() % (unsigned)(rkPos < RK_N ? rkPos : RK_N)];
+    if (r >= aliveCnt) return;
+    int pid = fenKth(aliveCnt - r);       // r-я по свежести живая труба
+    ll p, l; int base = (int)gPipes->size();
+    if (pid >= base) { p = simPos[pid - base]; l = simLen[pid - base]; }
+    else { p = (*gPipes)[pid].first; l = (*gPipes)[pid].second; }
+    if (p < 0) return;
+    addFree(p, l); fenAdd(pid, -1); simRemoved.push_back(pid);
+    if (pid >= base) simPos[pid - base] = -1; else (*gPipes)[pid].first = -(p + 2);   // временно помечаем удалённой
+}
+#ifndef RO_FROM
+#define RO_FROM 20000   // прямой поиск только после стольких укладок: на коротких траншеях одна копка решает всё,
+#endif                  // и выигрыш тонет в случайности прогона
+#ifndef RO_MARGIN
+#define RO_MARGIN 0.0   // на сколько метров другой кандидат должен быть дешевле выбора best-fit
+#endif
+#ifndef RO_MINR
+#define RO_MINR 2   // прямой поиск только для мёртвого остатка не короче RO_MINR
+#endif
+static ll simOps = 0, opsSeen = 0;
+#ifdef SIM
+static ll roCalls = 0, roPick[4];
+#endif
+#ifndef RO_EMERG
+#define RO_EMERG 4.6    // аварийная защита: при процессорном времени процесса больше RO_EMERG секунд прогоны
+#endif                  // прекращаются. В нормальной работе не срабатывает - результат не зависит от скорости машины
+static double cpuSeconds() {   // процессорное время процесса (user + kernel)
+#if defined(_WIN32)
+    FILETIME c, e, k, u;
+    if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return 0;
+    ULARGE_INTEGER a, b; a.LowPart = k.dwLowDateTime; a.HighPart = k.dwHighDateTime; b.LowPart = u.dwLowDateTime; b.HighPart = u.dwHighDateTime;
+    return (double)(a.QuadPart + b.QuadPart) * 1e-7;
+#else
+    return (double)clock() / CLOCKS_PER_SEC;
+#endif
+}
+static bool roStopped = false;
+static ll roChecks = 0;
+static inline bool roTimeOk() {
+    if (roStopped) return false;
+    if ((++roChecks & 63) == 0 && cpuSeconds() > RO_EMERG) roStopped = true;
+    return !roStopped;
+}
+#ifndef RO_ALT
+#define RO_ALT 0        // кандидат: дыра той же длины, но самая правая (молодая зона)
+#endif
+#ifndef RO_ALL
+#define RO_ALL 0        // запускать поиск при любом неточном выборе дыры, а не только при мёртвом остатке
+#endif
+#ifndef RO_NOB
+#define RO_NOB 0        // 1 - сравнивать только «как best-fit» и «докопать» (третий кандидат выигрывает редко)
+#endif
+#ifndef RO_RATE
+#define RO_RATE 20      // бюджет: в среднем не больше RO_RATE симулированных операций на одну операцию теста
+#endif
+#ifndef RO_SEED
+#define RO_SEED 7ULL    // «соль» генератора прогонов
+#endif
+#ifndef RO_LAMBDA
+#define RO_LAMBDA 1.0
+#endif
+static double deadMeters() {   // мёртвые дыры целиком + доля RO_LAMBDA от простаивающих пригодных (кроме хвоста)
+    double m = 0, idle = 0;
+    for (int k = 1; k <= SM; k++) { double v = (double)k * (double)ba[k].size(); if (!rwFillable(k)) m += v; else idle += v; }
+    idle += (double)bigSum;
+    ll e = holeEndingAt(trenchLen);
+    if (e >= 0) { ll t = trenchLen - e; if (t <= SM && !rwFillable(t)) m -= t; else idle -= t; }
+    return m + RO_LAMBDA * idle;
+}
+// Стоимость варианта: положить трубу L в дыру (hs, hl) (hs < 0 - докопать) и прожить RO_H операций.
+static double evalCand(ll L, ll hs, ll hl, unsigned long long seed) {
+    ll trench0 = trenchLen; simOn = true; simN = 0; simRemoved.clear();
+    if (hs >= 0) { delRaw(hs, hl); if (hl > L) addRaw(hs + L, hl - L); simPos[0] = hs; }
+    else {
+        ll ts = trenchLen, tl = 0; ll e = holeEndingAt(trenchLen);
+        if (e >= 0) { ts = e; tl = trenchLen - ts; delRaw(ts, tl); }
+        ll need = L - tl, dig = need > 0 ? (need + 19) / 20 : 0;
+        trenchLen += 20 * dig; ll nl = tl + 20 * dig; if (nl > L) addRaw(ts + L, nl - L); simPos[0] = ts;
+    }
+    simLen[0] = L; simN = 1; fenAdd((int)gPipes->size(), +1);
+    rng = seed;
+    int window = (int)(opPos < OP_N ? opPos : OP_N);
+    simOps += RO_H;
+    for (int t = 0; t < RO_H && simN < 4000; t++) {
+        bool place = window == 0 || (int)(rnd() % (unsigned)window) < opPl;
+        if (place) {
+            int wl = (int)(rwPos < RW_N ? rwPos : RW_N);
+            simPlace(rwBuf[rnd() % (unsigned)wl]);
+        } else simRemove();
+    }
+    double cost = (double)trenchLen + (double)deadMeters();
+    // откат
+    int base = (int)gPipes->size();
+    for (int pid : simRemoved) {
+        fenAdd(pid, +1);
+        if (pid < base) (*gPipes)[pid].first = -(*gPipes)[pid].first - 2;
+    }
+    for (int i = 0; i < simN; i++) fenAdd(base + i, -1);
+    undoAll(); trenchLen = trench0;
+    return cost;
+}
+
 int main() {
     ll& trench = trenchLen;
     ll laid = 0;
@@ -231,6 +492,7 @@ int main() {
     { double w; int n; if (scanf("%lf %d", &w, &n) != 2) return 1; }
 #endif
     vector<pair<ll,ll>> pipes;  pipes.reserve(200005);  pipes.push_back({-1,-1});
+    gPipes = &pipes;
     vector<int> runIdx;         runIdx.reserve(200005); runIdx.push_back(-1);
     vector<int> runId;          runId.reserve(200005);  runId.push_back(-1);
 
@@ -243,6 +505,8 @@ int main() {
     bool havePattern = false, expTrusted = false;
     int patPeriod = 2, patMask = 0, patRunLen = 0, patRunLenPrev = 0, expLen = 0;   // шаблон: удаляются позиции i, у которых (patMask >> (i % patPeriod)) & 1
     int remBurst = 0;                          // удалений подряд после последней укладки
+    ll removedTotal = 0;                       // удалений с начала теста
+    bool patSeen = false;                      // режим 2 хоть раз находил шаблон удалений пачки
     int minLen = SM + 1;                       // самая короткая встреченная труба
     // Режим 4: период по всем укладкам; судьба трубы известна через L4_H укладок.
     vector<int> allLens; allLens.reserve(200005);
@@ -255,6 +519,7 @@ int main() {
     for (;;) {
         int cmd = readInt();
         if (cmd == 0 || cmd == INT_MIN) break;
+        opsSeen++;
 
         if (cmd > 0) {
             ll L = cmd;
@@ -286,6 +551,7 @@ int main() {
                         }
                     }
                     havePattern = found;
+                    if (found) patSeen = true;
                 }
                 curSize = (int)L; curRun++; curCount = 0; remIdx.clear();
             }
@@ -293,6 +559,7 @@ int main() {
             if (++laid == SWITCH_AT) KMIN = KMIN1;
             if (L < minLen) minLen = (int)L;
             noteLen((int)L);
+            rwPush((int)L);
             int idx = curCount++;
             bool phase  = havePattern && patRunLen >= MIN_RUN;          // режим 2
             bool doomed = phase && (((patMask >> (idx % patPeriod)) & 1) != 0);
@@ -346,6 +613,15 @@ int main() {
                     phase = true; prior = true;
                     doomed = (res % 2 == 0) && !(per % 2 == 1 && res == per - 1);
                 }
+#if RUN_GUESS
+                // Пачка одинаковых труб без удалений, шаблон ещё не выучен: угадываем «удалят каждую
+                // вторую, начиная с первой» (так устроены открытые тесты-лестницы). Проверка та же, что
+                // у режима 3: при частых ошибках догадка выключается навсегда.
+                else if (idx >= RUN_GUESS && (int)runLens.size() > idx && (!RUN_GUESS_FIRST || removedTotal == 0 || patSeen)) {
+                    phase = true; prior = true;
+                    doomed = idx % 2 == 0;
+                }
+#endif
             }
 
             ll hs = -1, hl = -1, D, dig = 0;
@@ -355,7 +631,44 @@ int main() {
                 if (got) { hs = *ba[(int)L].begin(); hl = L; }
             }
             else if (learned) got = goodFit(L, hs, hl);   // режим 4, обречённая: переиспользует дыры
-            else if (!phase) got = goodFit(L, hs, hl);
+            else if (!phase) {
+                got = goodFit(L, hs, hl);
+                bool deadRem = hl - L >= RO_MINR && !rwFillable(hl - L);
+                if (RO_ON && got && laid >= RO_FROM && hs + hl != trench && (deadRem || (RO_ALL && hl > L))
+                    && simOps + 4LL * RO_R * RO_H <= (ll)RO_RATE * opsSeen && roTimeOk()) {
+#ifdef SIM
+                    roCalls++;
+#endif
+                    // сравниваем выбор best-fit с альтернативами прогоном будущего
+                    ll cs[4], cl[4]; int nc = 0;
+                    cs[nc] = hs; cl[nc] = hl; nc++;                                  // 0: как best-fit
+                    cs[nc] = -1; cl[nc] = 0; nc++;                                   // 1: докопать
+                    if (!RO_NOB) {                                                   // 2: лучшая дыра с заполнимым остатком
+                        ll bh = -1, bl = -1;
+                        for (int k = (int)L; k <= SM && bh < 0; k++)
+                            if (!ba[k].empty() && rwFillable(k - L)) { bh = *ba[k].begin(); bl = k; }
+                        if (bh < 0 && !big.empty()) { auto it = big.begin(); bh = it->second; bl = it->first; }
+                        if (bh >= 0 && bh != hs) { cs[nc] = bh; cl[nc] = bl; nc++; }
+                    }
+                    if (RO_ALT && hl <= SM && ba[hl].size() > 1) {                   // 3: та же длина, самая правая дыра
+                        ll rh = *ba[hl].rbegin();
+                        if (rh != hs) { cs[nc] = rh; cl[nc] = hl; nc++; }
+                    }
+                    double best = 1e18; int bi = 0;
+                    unsigned long long seed0 = (0x9E3779B97F4A7C15ULL + RO_SEED * 0xD1B54A32D192ED03ULL) ^ (unsigned long long)pipes.size() * 0x100000001B3ULL;
+                    for (int c = 0; c < nc; c++) {
+                        double tot = 0;
+                        for (int r = 0; r < RO_R; r++) tot += evalCand(L, cs[c], cl[c], seed0 + 7919ULL * r + 1);
+                        tot /= RO_R;
+                        if (c > 0) tot += RO_MARGIN;          // от выбора best-fit уходим, только если выигрыш заметен
+                        if (tot < best - 1e-9) { best = tot; bi = c; }
+                    }
+                    if (cs[bi] < 0) got = false; else { hs = cs[bi]; hl = cl[bi]; }
+#ifdef SIM
+                    roPick[bi]++;
+#endif
+                }
+            }
             else   // режим 3 (удалений может не быть вовсе): не оставлять щелей, которые нечем заполнить
                 got = doomed ? rightFit(L, hs, hl, prior) : leftFit(L, hs, hl, prior);
             if (got) {
@@ -386,6 +699,7 @@ int main() {
                 else        { D = ts + nl - L;    if (nl > L) addRaw(ts, nl - L); }
             }
 
+            fenAdd((int)pipes.size(), +1); notePlace();
             pipes.push_back({D, L}); runIdx.push_back(idx); runId.push_back(curRun);
             predDoom.push_back(prior ? (doomed ? 1 : 0) : -1);
             lpPer.push_back((signed char)lper); lpRes.push_back((signed char)lres);
@@ -394,9 +708,11 @@ int main() {
         } else {
             ll k = -cmd;
             answer1(pipes[k].first);
+            noteRemove(aliveCnt - fenPre((int)k));   // сколько живых труб уложено после неё
+            fenAdd((int)k, -1);
             addFree(pipes[k].first, pipes[k].second);
             if (runId[k] == curRun) remIdx.push_back(runIdx[k]);
-            remBurst++;
+            remBurst++; removedTotal++;
             if (predDoom[k] >= 0) {                   // сверяем предположение режима 3 с реальностью
                 if (predDoom[k] == 1) priorHit++; else priorMiss++;
                 if (priorHit + priorMiss >= 50 && priorMiss > priorHit) priorBad = true;
@@ -407,6 +723,7 @@ int main() {
     }
 #ifdef SIM
     { ll alive = 0; for (size_t i = 1; i < pipes.size(); i++) if (pipes[i].first >= 0) alive += pipes[i].second;
+      if (RO_ON) fprintf(stderr, "rollout decisions %lld: kept %lld, dig %lld, other hole %lld, right same size %lld; sim ops %lld\n", roCalls, roPick[0], roPick[1], roPick[2], roPick[3], simOps);
       fprintf(stderr, "RATIO %.6f alive %lld trench %lld\n", (double)alive / (double)trench, alive, trench); }
 #endif
     return 0;

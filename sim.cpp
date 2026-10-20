@@ -361,6 +361,8 @@ int main(int argc, char** argv) {
         {"small->big", SMALL_BIG, false, 0.5, 1000, 0},
         {"pct.7->big", PCT_BIG,   false, 0,   0,    0.7},
         {"pct.9->big", PCT_BIG,   false, 0,   0,    0.9},
+        {"last-left",  LAST,      false, 0,   0,    0},
+        {"last-right", LAST,      true,  0,   0,    0},
     };
     // SIGMA3: маленькие всегда worst-fit, для средних и больших перебираем политики
     const pair<Mode, const char*> pol[] = {{BEST, "B"}, {BESTK, "K"}, {FIRST, "F"}, {WORST, "W"}, {LAST, "L"}};
