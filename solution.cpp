@@ -29,6 +29,8 @@
 //   большие непрерывные блоки. Предположение проверяется по реальным удалениям и отключается навсегда,
 //   если оно оказывается неверным чаще, чем верным. Так же угадывается шаблон длинной пачки одинаковых
 //   труб, пока режим 2 его ещё не выучил: начиная с RUN_GUESS-й трубы «удалят каждую вторую».
+//   Копаем впрок на PR_DIG периодов потока (догадка по пачке - блоками по GR_BLK м), иначе копка по 20 м
+//   режет обречённые трубы на мелкие куски, в которые следующие трубы не влезают.
 //   Удалений может не быть вовсе, поэтому режим не берёт
 //   дыры, после которых остаётся щель, не набираемая суммой встреченных длин, и не оставляет у конца
 //   траншеи слева от трубы щель короче самой короткой трубы.
@@ -51,6 +53,12 @@
 //   Изменения прогона пишутся в журнал и откатываются. Объём поиска задан только бюджетом RO_RATE
 //   симулированных операций на операцию теста, поэтому результат не зависит от скорости машины;
 //   замер времени (RO_EMERG) - лишь аварийная защита от превышения лимита.
+//
+// Правило докопки (режим 1): на длинном уровне мёртвый остаток >= DIG_R м не оставляем никогда - докапываем
+//   (прямой поиск выбирал докопку слишком редко). Мёртвым считается и остаток, который могли бы заполнить лишь
+//   редкие мелкие трубы (по 1 м среди длинных): их доля в коротком окне мала и не покрывает уже накопленные мелкие
+//   дыры. На коротком уровне докапываем после смены фазы (мелкие трубы были частыми, а теперь пропали) и когда
+//   большинство труб остаётся навсегда (тогда и остаток вечный; если трубы снимают, остаток уходит вместе с ними).
 //
 // Сборка с -DSIM читает тест из stdin без интерактора и печатает итоговый KPI в stderr.
 #include <cstdio>
@@ -97,11 +105,23 @@ static const ll GUARD = P_GUARD;         // правило правой дыры
 static const ll CAP_MULT = 1;            // без подтверждённого прогноза копаем вперёд не больше CAP_MULT x уложенного в пачке
 static const int L4_H = 64;              // режим 4: через сколько укладок трубу считаем оставшейся навсегда
 static const int L4_PURE = 80;           // режим 4: позиция чистая, если её удаляют в >= 80% случаев или в <= 20%
+#ifndef TAIL_DOOM
+#define TAIL_DOOM 1
+#endif
+#ifndef TD_TRUST
+#define TD_TRUST 3
+#endif
 #ifndef RUN_GUESS_FIRST
 #define RUN_GUESS_FIRST 1        // угадывать, только пока в тесте не было удалений или режим 2 уже видел шаблон пачки
 #endif
+#ifndef PR_DIG
+#define PR_DIG 2                 // режим 3 по периоду потока: копать впрок на PR_DIG периодов (0 - выкл)
+#endif
+#ifndef GR_BLK
+#define GR_BLK 64                // догадка по первой пачке (до первого удаления): копать блоками не меньше GR_BLK метров
+#endif
 #ifndef RUN_GUESS
-#define RUN_GUESS 20             // с какой трубы первой пачки угадывать шаблон «удалят каждую вторую» (0 - выкл)
+#define RUN_GUESS 5              // с какой трубы первой пачки угадывать шаблон «удалят каждую вторую» (-1 - выкл)
 #endif
 static ll KMIN = P_KMIN0;
 static ll trenchLen = 0;                 // текущая длина траншеи (нужна внутри goodFit)
@@ -221,6 +241,49 @@ static inline bool rwFillable(ll r) {
         rwDirty = false;
     }
     return rwFill[r];
+}
+// Нехватка мелких труб (короткое окно последних BW_N укладок). Остаток r считаем мёртвым, если трубы не длиннее r
+// дают меньше доли BW_S метров окна и их не хватает даже на уже накопленные дыры не длиннее r (с запасом BW_C).
+// Так редкие трубы по 1 м среди длинных не «спасают» мелкие остатки, а при равномерных длинах 1..40 (где мелких
+// мало по метрам, но на остатки хватает) правило молчит.
+#ifndef BW_N
+#define BW_N 200
+#endif
+#ifndef BW_S
+#define BW_S 0.01
+#endif
+#ifndef BW_C
+#define BW_C 1.0
+#endif
+#ifndef BW_R
+#define BW_R 3     // с какого остатка действует правило
+#endif
+static int bwBuf[BW_N > 0 ? BW_N : 1]; static ll bwPos = 0, bwM[SM + 1], bwTot = 0;
+static void bwPush(int L) {
+    if (!BW_N) return;
+    if (bwPos >= BW_N) { bwM[bwBuf[bwPos % BW_N]] -= bwBuf[bwPos % BW_N]; bwTot -= bwBuf[bwPos % BW_N]; }
+    bwBuf[bwPos % BW_N] = L; bwPos++; bwM[L] += L; bwTot += L;
+}
+static bool bwFillable(ll r) {
+    if (!BW_N || r <= 0 || r > SM) return true;
+    double sup = 0, dem = (double)r;
+    for (int v = 1; v <= r; v++) { sup += (double)bwM[v]; dem += (double)v * (double)ba[v].size(); }
+    if (sup >= BW_S * (double)bwTot) return true;   // мелких труб в потоке достаточно
+    return BW_C > 0 && dem <= BW_C * sup;           // мало, но на накопленные мелкие дыры хватит
+}
+// Смена фазы: трубы не длиннее r за весь тест составили не меньше PH_FRAC укладок, а в коротком окне их не хватает
+// (открытые тесты 11 и 15: сначала только трубы 1..7, потом только 8..40).
+#ifndef PH_S
+#define PH_S 2       // короткий уровень: после смены фазы остаток >= PH_S не оставляем - докапываем (0 - выкл)
+#endif
+#ifndef PH_FRAC
+#define PH_FRAC 0.3
+#endif
+static ll allCnt[SM + 1], allN = 0;
+static bool phaseDead(ll r) {
+    if (r <= 0 || r > SM || bwFillable(r)) return false;
+    ll c = 0; for (int v = 1; v <= r; v++) c += allCnt[v];
+    return (double)c >= PH_FRAC * (double)allN;
 }
 static inline bool deadRest(int k, ll L, bool skipDead) {   // дыра длины k оставила бы мёртвый остаток
     return skipDead && k <= SM && k != L && !fillable[k - L];
@@ -399,10 +462,31 @@ static void simRemove() {
 #ifndef RO_MARGIN
 #define RO_MARGIN 0.0   // на сколько метров другой кандидат должен быть дешевле выбора best-fit
 #endif
+#ifndef DIG_R
+#define DIG_R 3     // длинный уровень: мёртвый остаток >= DIG_R не оставляем - докапываем (0 - выкл)
+#endif
 #ifndef RO_MINR
 #define RO_MINR 2   // прямой поиск только для мёртвого остатка не короче RO_MINR
 #endif
-static ll simOps = 0, opsSeen = 0;
+static ll simOps = 0, simOpsS = 0, opsSeen = 0;
+#ifndef S_ON
+#define S_ON 1          // прямой поиск на коротких тестах (до RO_FROM укладок)
+#endif
+#ifndef S_R
+#define S_R 16
+#endif
+#ifndef S_H
+#define S_H 128
+#endif
+#ifndef S_MINR
+#define S_MINR 1
+#endif
+#ifndef S_SEED
+#define S_SEED 4ULL
+#endif
+#ifndef S_MAX
+#define S_MAX 2000000   // потолок симулированных операций на коротком уровне за весь тест
+#endif
 #ifdef SIM
 static ll roCalls = 0, roPick[4];
 #endif
@@ -444,6 +528,19 @@ static inline bool roTimeOk() {
 #ifndef RO_LAMBDA
 #define RO_LAMBDA 1.0
 #endif
+#ifndef DIG_S
+#define DIG_S 2       // короткий уровень: мёртвый остаток от DIG_S до DS_MAX м докапываем, если трубы в основном
+#endif                // остаются навсегда (иначе остаток исчезнет вместе с трубой, и копать незачем)
+#ifndef DS_MAX
+#define DS_MAX 7
+#endif
+#ifndef SV_MIN
+#define SV_MIN 0.42   // доля «вечных» укладок, начиная с которой остаток считаем вечным
+#endif
+static inline double survRate() {   // (укладки - удаления) / укладки в окне последних операций
+    int w = (int)(opPos < OP_N ? opPos : OP_N);
+    return opPl ? (double)(2 * opPl - w) / (double)opPl : 1.0;
+}
 static double deadMeters() {   // мёртвые дыры целиком + доля RO_LAMBDA от простаивающих пригодных (кроме хвоста)
     double m = 0, idle = 0;
     for (int k = 1; k <= SM; k++) { double v = (double)k * (double)ba[k].size(); if (!rwFillable(k)) m += v; else idle += v; }
@@ -453,6 +550,7 @@ static double deadMeters() {   // мёртвые дыры целиком + до�
     return m + RO_LAMBDA * idle;
 }
 // Стоимость варианта: положить трубу L в дыру (hs, hl) (hs < 0 - докопать) и прожить RO_H операций.
+static int roH = RO_H;   // горизонт текущего прогона (свой для коротких и длинных тестов)
 static double evalCand(ll L, ll hs, ll hl, unsigned long long seed) {
     ll trench0 = trenchLen; simOn = true; simN = 0; simRemoved.clear();
     if (hs >= 0) { delRaw(hs, hl); if (hl > L) addRaw(hs + L, hl - L); simPos[0] = hs; }
@@ -465,8 +563,7 @@ static double evalCand(ll L, ll hs, ll hl, unsigned long long seed) {
     simLen[0] = L; simN = 1; fenAdd((int)gPipes->size(), +1);
     rng = seed;
     int window = (int)(opPos < OP_N ? opPos : OP_N);
-    simOps += RO_H;
-    for (int t = 0; t < RO_H && simN < 4000; t++) {
+    for (int t = 0; t < roH && simN < 4000; t++) {
         bool place = window == 0 || (int)(rnd() % (unsigned)window) < opPl;
         if (place) {
             int wl = (int)(rwPos < RW_N ? rwPos : RW_N);
@@ -503,6 +600,7 @@ int main() {
     ll priorHit = 0, priorMiss = 0; bool priorBad = false;
     vector<int> remIdx;                        // позиции удалённых труб текущей пачки
     bool havePattern = false, expTrusted = false;
+    int trustRuns = 0;
     int patPeriod = 2, patMask = 0, patRunLen = 0, patRunLenPrev = 0, expLen = 0;   // шаблон: удаляются позиции i, у которых (patMask >> (i % patPeriod)) & 1
     int remBurst = 0;                          // удалений подряд после последней укладки
     ll removedTotal = 0;                       // удалений с начала теста
@@ -530,6 +628,7 @@ int main() {
                 if (curSize >= 0 && curCount >= MIN_RUN && !remIdx.empty()) {
                     // прогноз длины пачки заслуживает доверия, если прошлый прогноз сбылся с точностью 10%
                     expTrusted = havePattern && expLen > 0 && llabs((ll)curCount - expLen) * 10 <= expLen;
+                    trustRuns = expTrusted ? trustRuns + 1 : 0;   // сколько прогнозов подряд сбылось
                     ll cnt = (ll)remIdx.size();
                     bool found = false;
                     if (cnt * 4 >= curCount && cnt * 4 <= (ll)curCount * 3) {
@@ -559,11 +658,13 @@ int main() {
             if (++laid == SWITCH_AT) KMIN = KMIN1;
             if (L < minLen) minLen = (int)L;
             noteLen((int)L);
-            rwPush((int)L);
+            rwPush((int)L); bwPush((int)L); allCnt[L]++; allN++;
             int idx = curCount++;
             bool phase  = havePattern && patRunLen >= MIN_RUN;          // режим 2
             bool doomed = phase && (((patMask >> (idx % patPeriod)) & 1) != 0);
             bool prior = false;                // режим 3: решение по предположению
+            bool guessRun = false;             // догадка по пачке одинаковых труб (RUN_GUESS)
+            int prPer = 0; ll prSum = 0;       // режим 3: период потока и сумма длин за период
             bool learned = false;              // режим 4: решение по выученной судьбе позиций периода
             runLens.push_back((int)L);
 
@@ -609,23 +710,25 @@ int main() {
             if (!phase && !priorBad) {
                 int per = detectPeriod(runLens);
                 if (per > 0) {
+                    prPer = per; prSum = 0;
+                    for (int j = 0; j < per; j++) prSum += runLens[runLens.size() - 1 - j];
                     int res = (int)(runLens.size() - 1) % per;
                     phase = true; prior = true;
                     doomed = (res % 2 == 0) && !(per % 2 == 1 && res == per - 1);
                 }
-#if RUN_GUESS
+#if RUN_GUESS >= 0
                 // Пачка одинаковых труб без удалений, шаблон ещё не выучен: угадываем «удалят каждую
                 // вторую, начиная с первой» (так устроены открытые тесты-лестницы). Проверка та же, что
                 // у режима 3: при частых ошибках догадка выключается навсегда.
                 else if (idx >= RUN_GUESS && (int)runLens.size() > idx && (!RUN_GUESS_FIRST || removedTotal == 0 || patSeen)) {
-                    phase = true; prior = true;
+                    phase = true; prior = true; guessRun = true;
                     doomed = idx % 2 == 0;
                 }
 #endif
             }
 
             ll hs = -1, hl = -1, D, dig = 0;
-            bool got;
+            bool got, forcedTail = false;
             if (learned && !doomed) {          // режим 4, остающаяся: точная дыра, иначе хвост траншеи
                 got = !ba[(int)L].empty();
                 if (got) { hs = *ba[(int)L].begin(); hl = L; }
@@ -633,9 +736,27 @@ int main() {
             else if (learned) got = goodFit(L, hs, hl);   // режим 4, обречённая: переиспользует дыры
             else if (!phase) {
                 got = goodFit(L, hs, hl);
-                bool deadRem = hl - L >= RO_MINR && !rwFillable(hl - L);
-                if (RO_ON && got && laid >= RO_FROM && hs + hl != trench && (deadRem || (RO_ALL && hl > L))
-                    && simOps + 4LL * RO_R * RO_H <= (ll)RO_RATE * opsSeen && roTimeOk()) {
+                // два уровня: до RO_FROM укладок (короткие тесты, решений мало) - много прогонов S_R с горизонтом
+                // S_H и общий потолок S_MAX симулированных операций; дальше - один прогон RO_R с горизонтом RO_H
+                // и бюджетом RO_RATE на операцию теста
+                bool shortTier = laid < RO_FROM;
+                int tR = shortTier ? S_R : RO_R, tH = shortTier ? S_H : RO_H, tMinR = shortTier ? S_MINR : RO_MINR;
+                ll& tOps = shortTier ? simOpsS : simOps;
+                ll tBudget = shortTier ? (ll)S_MAX : (ll)RO_RATE * opsSeen;
+                bool deadRem = hl - L >= tMinR && !rwFillable(hl - L);
+                // Правило докопки (вместо прямого поиска, который в среднем выбирал докопку слишком редко):
+                //   длинный уровень - остаток >= DIG_R, которого не набрать длинами окна, или >= BW_R при нехватке мелких труб;
+                //   короткий уровень - после смены фазы (мелкие трубы были частыми, а в коротком окне исчезли) или
+                //   когда трубы в основном остаются навсегда, а мёртвый остаток невелик.
+                ll rem = hl - L;
+                bool digRule = got && trench > GUARD && hs + hl != trench && rem > 0 &&
+                    (shortTier ? ((PH_S && rem >= PH_S && phaseDead(rem)) ||
+                                  (DIG_S && rem >= DIG_S && rem <= DS_MAX && !rwFillable(rem) && survRate() >= SV_MIN))
+                               : ((DIG_R && rem >= DIG_R && !rwFillable(rem)) || (rem >= BW_R && !bwFillable(rem))));
+                if (digRule) { got = false; deadRem = false; }
+                if (RO_ON && got && (!shortTier || S_ON) && trench > GUARD && hs + hl != trench && (deadRem || (RO_ALL && hl > L))
+                    && tOps + 4LL * tR * tH <= tBudget && roTimeOk()) {
+                    roH = tH;
 #ifdef SIM
                     roCalls++;
 #endif
@@ -655,11 +776,12 @@ int main() {
                         if (rh != hs) { cs[nc] = rh; cl[nc] = hl; nc++; }
                     }
                     double best = 1e18; int bi = 0;
-                    unsigned long long seed0 = (0x9E3779B97F4A7C15ULL + RO_SEED * 0xD1B54A32D192ED03ULL) ^ (unsigned long long)pipes.size() * 0x100000001B3ULL;
+                    unsigned long long seed0 = (0x9E3779B97F4A7C15ULL + (shortTier ? S_SEED : RO_SEED) * 0xD1B54A32D192ED03ULL)
+                                               ^ (unsigned long long)pipes.size() * 0x100000001B3ULL;
                     for (int c = 0; c < nc; c++) {
                         double tot = 0;
-                        for (int r = 0; r < RO_R; r++) tot += evalCand(L, cs[c], cl[c], seed0 + 7919ULL * r + 1);
-                        tot /= RO_R;
+                        for (int r = 0; r < tR; r++) { tot += evalCand(L, cs[c], cl[c], seed0 + 7919ULL * r + 1); tOps += tH; }
+                        tot /= tR;
                         if (c > 0) tot += RO_MARGIN;          // от выбора best-fit уходим, только если выигрыш заметен
                         if (tot < best - 1e-9) { best = tot; bi = c; }
                     }
@@ -670,7 +792,12 @@ int main() {
                 }
             }
             else   // режим 3 (удалений может не быть вовсе): не оставлять щелей, которые нечем заполнить
+            {
                 got = doomed ? rightFit(L, hs, hl, prior) : leftFit(L, hs, hl, prior);
+                // режим 2: обречённая труба не должна занимать хвостовой блок (это место прошлых обречённых,
+                // его заполнят остающиеся слева). Если в хвосте нет места под весь остаток пачки - докапываем.
+                if (TAIL_DOOM && got && doomed && !prior && trustRuns >= TD_TRUST && hs + hl == trench && hl < (ll)(expLen - idx) * L) { got = false; forcedTail = true; }
+            }
             if (got) {
                 delRaw(hs, hl);
                 // Обречённую кладём к правому краю, но не в хвостовую дыру, если слева осталась бы щель
@@ -685,10 +812,17 @@ int main() {
                 if (e >= 0) { ts = e; tl = trench - ts; delRaw(ts, tl); }
                 ll need = L - tl;
                 if (learned && doomed && l4dig - tl > need) need = l4dig - tl;   // место под все обречённые трубы периода
+                // без удалений копка по 20 м режет обречённые трубы периода на мелкие куски: копаем впрок
+                if (PR_DIG && prior && !guessRun && prPer > 0) { ll ahead = (ll)PR_DIG * prSum - tl; if (ahead > need) need = ahead; }
+                if (GR_BLK && guessRun && removedTotal == 0 && GR_BLK - tl > need) need = GR_BLK - tl;
                 if (phase && !prior && !learned) {   // режим 2: копаем сразу на остаток пачки
                     ll rest = (ll)(expLen - idx) * L - tl;
                     ll cap = CAP_MULT * (ll)idx * L + 40;
-                    if (!expTrusted && rest > cap) rest = cap;
+                    if ((!expTrusted || (forcedTail && TAIL_DOOM == 2)) && rest > cap) rest = cap;
+                    if (forcedTail && TAIL_DOOM == 3) {   // только под оставшиеся обречённые трубы пачки
+                        int dc = 0; for (int r = 0; r < patPeriod; r++) dc += (patMask >> r) & 1;
+                        rest = (ll)(expLen - idx) * L * dc / patPeriod + L - tl;
+                    }
                     if (rest > need) need = rest;
                 }
                 dig = need > 0 ? (need + 19) / 20 : 0;   // хвост может быть уже длиннее нужного (режим 4)
