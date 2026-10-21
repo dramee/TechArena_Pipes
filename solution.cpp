@@ -61,6 +61,18 @@
 //   большинство труб остаётся навсегда (тогда и остаток вечный; если трубы снимают, остаток уходит вместе с ними).
 //
 // Сборка с -DSIM читает тест из stdin без интерактора и печатает итоговый KPI в stderr.
+//
+// Защиты от непокрытых открытыми тестами ловушек (на открытых тестах ни один KPI не меняется):
+//   - теневой best-fit (SH_*): параллельно ведётся виртуальная траншея простейшего best-fit; если наша
+//     длиннее на 2% + 200 м, порог KMIN, правило докопки и прямой поиск выключаются до конца теста;
+//   - запасная дыра перед докопкой (FIX_ALT): при доле дыр > FREE_GATE ищем дыру с заполнимым остатком
+//     (раньше смотрели одну кандидатуру и копали рядом с огромной пустой дырой);
+//   - защита частой длины (FIX_PROT): первый проход goodFit не дробит дыры, точно равные длине,
+//     которая составляет >= 15% окна (иначе мелкие трубы стачивают такие дыры до KMIN и «паркуются»);
+//   - догадка по пачке без удалений (FIX_LCM, FIX_GAP): блок копки кратен длине трубы, а щели между
+//     блоками занимаются, когда дыр стало много;
+//   - при доле дыр > FREE_GATE2 первый проход goodFit работает как чистый best-fit (FIX_BF);
+//   - режим 2 выучивает шаблон удалений пачки и при шуме до PAT_TOL% (часть удалений не по шаблону).
 #include <cstdio>
 #include <cstdlib>
 #include <climits>
@@ -68,6 +80,7 @@
 #include <vector>
 #include <set>
 #include <utility>
+#include <map>
 
 #if defined(_WIN32)
   #define GETC _getchar_nolock
@@ -123,7 +136,91 @@ static const int L4_PURE = 80;           // режим 4: позиция чис�
 #ifndef RUN_GUESS
 #define RUN_GUESS 5              // с какой трубы первой пачки угадывать шаблон «удалят каждую вторую» (-1 - выкл)
 #endif
+// ---- Защиты от ловушек (значения по умолчанию; все проверены так, что открытые тесты не меняются)
+#ifndef PAT_TOL
+#define PAT_TOL 5       // шаблон удалений пачки: допуск на шум, % (лестница с 1-8% «случайных» удалений)
+#endif
+#ifndef FIX_ALT
+#define FIX_ALT 1       // запасная дыра перед докопкой
+#endif
+#ifndef FREE_GATE
+#define FREE_GATE 0.08  // доля дыр в траншее, начиная с которой работают FIX_ALT и FIX_GAP
+#endif
+#ifndef FIX_GAP
+#define FIX_GAP 1       // догадка без удалений: занимать щели при большой доле дыр
+#endif
+#ifndef FIX_LCM
+#define FIX_LCM 1       // догадка без удалений: блок копки кратен длине трубы
+#endif
+#ifndef FIX_PROT
+#define FIX_PROT 15     // не дробить дыры под длину, которая составляет >= 15% окна
+#endif
+#ifndef FIX_BF
+#define FIX_BF 1        // при доле дыр > FREE_GATE2 - чистый best-fit в первом проходе
+#endif
+#ifndef FREE_GATE2
+#define FREE_GATE2 0.10
+#endif
+#ifndef SH_ON
+#define SH_ON 1         // теневой best-fit
+#endif
+#ifndef SH_STICKY
+#define SH_STICKY 1
+#endif
+#ifndef SH_REL
+#define SH_REL 0.02
+#endif
+#ifndef SH_ABS
+#define SH_ABS 200
+#endif
 static ll KMIN = P_KMIN0;
+
+// ---- Теневой best-fit. Поток команд не зависит от наших ответов, поэтому параллельно можно вести
+// «виртуальную траншею», которую укладывает простейший best-fit (точная дыра, иначе наименьшая
+// подходящая, иначе конец траншеи). Если наша траншея заметно длиннее теневой, умные правила обычного
+// режима (порог KMIN, правило докопки, прямой поиск) на этом потоке вредят - выключаем их.
+#ifndef SH_STICKY
+#define SH_STICKY 1
+#endif
+#ifndef SH_ON
+#define SH_ON 1
+#endif
+#ifndef SH_REL
+#define SH_REL 0.02
+#endif
+#ifndef SH_ABS
+#define SH_ABS 200
+#endif
+struct Shadow {
+    std::map<ll,ll> fa, fe; std::set<pair<ll,ll>> bs; ll trench = 0;
+    vector<pair<ll,ll>> p;
+    Shadow() { p.reserve(200005); p.push_back({-1, -1}); }
+    void addR(ll s0, ll l) { if (l <= 0) return; fa[s0] = l; fe[s0 + l] = s0; bs.insert({l, s0}); }
+    void delR(ll s0, ll l) { fa.erase(s0); fe.erase(s0 + l); bs.erase({l, s0}); }
+    void lay(ll L) {
+        auto it = bs.lower_bound({L, LLONG_MIN}); ll D;
+        if (it != bs.end()) { ll s0 = it->second, l = it->first; delR(s0, l); D = s0; addR(s0 + L, l - L); }
+        else {
+            ll ts = trench, tl = 0; auto e = fe.find(trench);
+            if (e != fe.end()) { ts = e->second; tl = trench - ts; delR(ts, tl); }
+            ll dg = (L - tl + 19) / 20; if (dg < 0) dg = 0; trench += 20 * dg; D = ts; addR(ts + L, tl + 20 * dg - L);
+        }
+        p.push_back({D, L});
+    }
+    void rem(ll k) {
+        ll s0 = p[k].first, l = p[k].second;
+        auto a = fe.find(s0); if (a != fe.end()) { ll ps = a->second; delR(ps, s0 - ps); l += s0 - ps; s0 = ps; }
+        auto b = fa.find(s0 + l); if (b != fa.end()) { ll nl = b->second; delR(s0 + l, nl); l += nl; }
+        addR(s0, l);
+    }
+};
+static Shadow* gSh = nullptr;
+static bool gBfMode = false;
+
+static bool gHighFree = false;   // дыр больше FREE_GATE траншеи: правила-предпочтения не работают, чистый best-fit
+#ifndef FIX_BF
+#define FIX_BF 1
+#endif
 static ll trenchLen = 0;                 // текущая длина траншеи (нужна внутри goodFit)
 
 // Дыры. Позиции и длины укладываются в int: интерактор ограничивает траншею 1e8 м.
@@ -305,9 +402,14 @@ static bool rightFit(ll L, ll& hs, ll& hl, bool skipDead = false) {  // сама
 
 // Первая непустая корзина размеров [lo, hi] (по возрастанию), минуя дыру ban; из равных по
 // размеру берём левую. Дыры длиннее 40 перебираем по возрастанию длины.
+static bool gProtect = false;   // первый проход goodFit: не дробить дыры точно под частую длину
 static bool firstBucket(ll lo, ll hi, ll ban, ll& hs, ll& hl, ll L = 0) {
     for (ll k = lo; k <= hi && k <= SM; k++) {
         if (ba[k].empty()) continue;
+        if (gProtect && FIX_PROT > 0 && rwPos >= 200) {
+            ll w = rwPos < RW_N ? rwPos : RW_N;
+            if ((ll)rwCnt[k] * 100 >= (ll)FIX_PROT * w) continue;
+        }
         if (L && !rwFillable(k - L)) continue;                // остаток нечем заполнить из текущего потока
         auto it = ba[k].begin();
         if (*it == ban && ++it == ba[k].end()) continue;
@@ -335,7 +437,10 @@ static bool goodFit(ll L, ll& hs, ll& hl) {
         if (!rightFit(L, rs, rl) || es != rs) { hs = es; hl = L; return true; }
         ban = es;                                         // точная дыра самая правая - поищем другую
     }
-    if (firstBucket(L + KMIN, LLONG_MAX, ban, hs, hl)) return true;
+    gProtect = !gBfMode;
+    bool fb1 = firstBucket(L + ((FIX_BF && gHighFree) || gBfMode ? 1 : KMIN), LLONG_MAX, ban, hs, hl);
+    gProtect = false;
+    if (fb1) return true;
     if (RW_MODE && trenchLen > GUARD && firstBucket(L, L + KMIN - 1, ban, hs, hl, L)) return true;
     if (RW_MODE == 2 && trenchLen > GUARD && ban < 0) {   // лучше докопать, чем оставить мёртвый остаток >= RW_T
         ll h2, l2;
@@ -344,6 +449,50 @@ static bool goodFit(ll L, ll& hs, ll& hl) {
     }
     if (firstBucket(L, L + KMIN - 1, ban, hs, hl)) return true;
     if (ban >= 0) { hs = ban; hl = L; return true; }
+    return false;
+}
+#ifndef FIX_ALT
+#define FIX_ALT 1
+#endif
+// Запасная дыра для правила докопки: прежде чем копать из-за мёртвого остатка, ищем дыру, где остаток
+// заполним (или длиннее 40 м). Без этого правило смотрело только на одну кандидатуру best-fit и копало,
+// даже когда рядом была огромная пустая дыра (поток длин растёт, удаляют старые - траншея разрасталась в 10 раз).
+#ifndef FIX_LCM
+#define FIX_LCM 1
+#endif
+#ifndef FREE_GATE2
+#define FREE_GATE2 0.10
+#endif
+#ifndef FIX_PROT
+#define FIX_PROT 15
+#endif
+#ifndef FIX_GAP
+#define FIX_GAP 1
+#endif
+#ifndef FREE_GATE
+#define FREE_GATE 0.08
+#endif
+static double freeShare() {   // доля траншеи, занятая дырами (без хвоста)
+    double f = (double)bigSum;
+    for (int k = 1; k <= SM; k++) f += (double)k * (double)ba[k].size();
+    ll e = holeEndingAt(trenchLen); if (e >= 0) f -= (double)(trenchLen - e);
+    return trenchLen > 0 ? f / (double)trenchLen : 0;
+}
+static bool altFit(ll L, ll& hs, ll& hl, bool shortTier) {
+    auto ok = [&](ll r) {
+        if (r == 0) return true;
+        if (r > SM) return true;
+        if (FIX_ALT == 2) return false;
+        if (shortTier) return !phaseDead(r) && rwFillable(r);
+        return rwFillable(r) && bwFillable(r);
+    };
+    for (int k = (int)L; k <= SM; k++)
+        if (!ba[k].empty() && ok(k - L)) { hs = *ba[k].begin(); hl = k; return true; }
+    int seen = 0;   // дыры 41..L+40 проверяем не больше 64 штук, дальше любая дыра годится (остаток > 40)
+    for (auto it = big.begin(); it != big.end() && it->first - L <= SM && seen < 64; ++it, ++seen)
+        if (ok(it->first - L)) { hs = it->second; hl = it->first; return true; }
+    auto it2 = big.lower_bound({(int)(L + SM + 1), INT_MIN});
+    if (it2 != big.end()) { hs = it2->second; hl = it2->first; return true; }
     return false;
 }
 // Наименьший период p (PRIOR_MIN_PERIOD..PRIOR_MAX_PERIOD), которому подчиняются последние PRIOR_REPS*p длин,
@@ -621,6 +770,8 @@ int main() {
 
         if (cmd > 0) {
             ll L = cmd;
+            if (SH_ON) { if (!gSh) gSh = new Shadow(); gSh->lay(L);
+                bool over = (double)trench > (double)gSh->trench * (1.0 + SH_REL) + SH_ABS; gBfMode = SH_STICKY ? (gBfMode || over) : over; }
 
             bool burst = curCount >= MIN_RUN && remBurst >= 5 && remBurst * 8 >= curCount;
             remBurst = 0;
@@ -639,8 +790,9 @@ int main() {
                             for (size_t i = 0; i < remIdx.size(); i++) remC[remIdx[i] % p]++;
                             bool ok = true; int mask = 0;
                             for (int r = 0; r < p && ok; r++) {
-                                if (remC[r] == totC[r] && totC[r] > 0) mask |= 1 << r;
-                                else if (remC[r] != 0) ok = false;
+                                // PAT_TOL: допускаем долю «шумных» удалений (не по шаблону) до PAT_TOL% в каждом остатке
+                                if (totC[r] > 0 && remC[r] * 100 >= totC[r] * (100 - PAT_TOL)) mask |= 1 << r;
+                                else if (remC[r] * 100 > totC[r] * PAT_TOL) ok = false;
                             }
                             if (ok && mask != 0 && mask != (1 << p) - 1) {
                                 found = true; patPeriod = p; patMask = mask;
@@ -656,6 +808,7 @@ int main() {
             }
 
             if (++laid == SWITCH_AT) KMIN = KMIN1;
+            if ((laid & 15) == 0) gHighFree = freeShare() > FREE_GATE2;
             if (L < minLen) minLen = (int)L;
             noteLen((int)L);
             rwPush((int)L); bwPush((int)L); allCnt[L]++; allN++;
@@ -749,12 +902,15 @@ int main() {
                 //   короткий уровень - после смены фазы (мелкие трубы были частыми, а в коротком окне исчезли) или
                 //   когда трубы в основном остаются навсегда, а мёртвый остаток невелик.
                 ll rem = hl - L;
-                bool digRule = got && trench > GUARD && hs + hl != trench && rem > 0 &&
+                bool digRule = !gBfMode && got && trench > GUARD && hs + hl != trench && rem > 0 &&
                     (shortTier ? ((PH_S && rem >= PH_S && phaseDead(rem)) ||
                                   (DIG_S && rem >= DIG_S && rem <= DS_MAX && !rwFillable(rem) && survRate() >= SV_MIN))
                                : ((DIG_R && rem >= DIG_R && !rwFillable(rem)) || (rem >= BW_R && !bwFillable(rem))));
-                if (digRule) { got = false; deadRem = false; }
-                if (RO_ON && got && (!shortTier || S_ON) && trench > GUARD && hs + hl != trench && (deadRem || (RO_ALL && hl > L))
+                if (digRule) {
+                    got = false; deadRem = false;
+                    if (FIX_ALT && freeShare() > FREE_GATE) { ll ah, al; if (altFit(L, ah, al, shortTier) && ah + al != trench) { hs = ah; hl = al; got = true; } }
+                }
+                if (RO_ON && !gBfMode && got && (!shortTier || S_ON) && trench > GUARD && hs + hl != trench && (deadRem || (RO_ALL && hl > L))
                     && tOps + 4LL * tR * tH <= tBudget && roTimeOk()) {
                     roH = tH;
 #ifdef SIM
@@ -794,6 +950,11 @@ int main() {
             else   // режим 3 (удалений может не быть вовсе): не оставлять щелей, которые нечем заполнить
             {
                 got = doomed ? rightFit(L, hs, hl, prior) : leftFit(L, hs, hl, prior);
+#if FIX_GAP
+                // догадка не подтверждается удалениями, а щели между блоками копки копятся: занимаем их,
+                // пусть и с мёртвым остатком (иначе траншея растёт вдвое быстрее загрузки)
+                if (!got && prior && freeShare() > FREE_GATE) got = doomed ? rightFit(L, hs, hl, false) : leftFit(L, hs, hl, false);
+#endif
                 // режим 2: обречённая труба не должна занимать хвостовой блок (это место прошлых обречённых,
                 // его заполнят остающиеся слева). Если в хвосте нет места под весь остаток пачки - докапываем.
                 if (TAIL_DOOM && got && doomed && !prior && trustRuns >= TD_TRUST && hs + hl == trench && hl < (ll)(expLen - idx) * L) { got = false; forcedTail = true; }
@@ -814,7 +975,19 @@ int main() {
                 if (learned && doomed && l4dig - tl > need) need = l4dig - tl;   // место под все обречённые трубы периода
                 // без удалений копка по 20 м режет обречённые трубы периода на мелкие куски: копаем впрок
                 if (PR_DIG && prior && !guessRun && prPer > 0) { ll ahead = (ll)PR_DIG * prSum - tl; if (ahead > need) need = ahead; }
-                if (GR_BLK && guessRun && removedTotal == 0 && GR_BLK - tl > need) need = GR_BLK - tl;
+                if (GR_BLK && guessRun && removedTotal == 0) {
+                    ll blk = GR_BLK;
+#if FIX_LCM
+                    // блок кратен и 20, и длине трубы: иначе между «остающимися» слева и «обречёнными» справа
+                    // в каждом блоке остаётся щель, которую трубы этой длины не заполнят никогда
+                    { ll g = 20, a = L; while (a) { ll t2 = g % a; g = a; a = t2; } ll lc = 20 / g * L;
+                      if (lc <= 400) blk = (GR_BLK + lc - 1) / lc * lc; }
+                    if (blk - tl > need) need = blk - tl;
+                    while ((tl + ((need + 19) / 20) * 20) % L != 0 && need < blk + 400) need += 20;
+#else
+                    if (blk - tl > need) need = blk - tl;
+#endif
+                }
                 if (phase && !prior && !learned) {   // режим 2: копаем сразу на остаток пачки
                     ll rest = (ll)(expLen - idx) * L - tl;
                     ll cap = CAP_MULT * (ll)idx * L + 40;
@@ -842,6 +1015,7 @@ int main() {
         } else {
             ll k = -cmd;
             answer1(pipes[k].first);
+            if (SH_ON && gSh) gSh->rem(k);
             noteRemove(aliveCnt - fenPre((int)k));   // сколько живых труб уложено после неё
             fenAdd((int)k, -1);
             addFree(pipes[k].first, pipes[k].second);
