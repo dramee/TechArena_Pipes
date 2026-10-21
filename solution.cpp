@@ -75,7 +75,8 @@
 //   - режим 2 выучивает шаблон удалений пачки и при шуме до PAT_TOL% (часть удалений не по шаблону);
 //   - шаблон режима 2 устаревает после STALE_K коротких пачек подряд;
 //   - правила докопки работают, только если оставленную дыру займут трубы текущего потока (DG_IDLE);
-//   - копка впрок не уводит траншею дальше теневой больше чем на SH_REL + SH_ABS (SH_CAP).
+//   - копка впрок не уводит траншею дальше теневой больше чем на SH_REL + SH_ABS (SH_CAP);
+//   - остаток дыры кладётся к более свежему соседу, если удаляют свежие трубы (ALIGN).
 #include <cstdio>
 #include <cstdlib>
 #include <climits>
@@ -176,10 +177,16 @@ static const int L4_PURE = 80;           // режим 4: позиция чис�
                         // правило докопки временно удлиняет траншею, а к концу теста выигрывает)
 #endif
 #ifndef SH_REL
-#define SH_REL 0.02
+#define SH_REL 0.01
 #endif
 #ifndef SH_ABS
 #define SH_ABS 200
+#endif
+#ifndef RS_GATE
+#define RS_GATE 80      // короткий уровень: прямой поиск, только пока отставание от теневой траншеи не больше RS_GATE м
+#endif
+#ifndef ALIGN
+#define ALIGN 1         // длинный уровень: остаток дыры - к более свежему соседу, если удаляют свежие трубы
 #endif
 #ifndef SH_CAP
 #define SH_CAP 1        // копка впрок не уводит траншею дальше теневой больше чем на SH_REL + SH_ABS
@@ -197,7 +204,7 @@ static ll KMIN = P_KMIN0;
 #define SH_ON 1
 #endif
 #ifndef SH_REL
-#define SH_REL 0.02
+#define SH_REL 0.01
 #endif
 #ifndef SH_ABS
 #define SH_ABS 200
@@ -254,6 +261,7 @@ struct PagedArray {
     }
 };
 static PagedArray hLenA, hBegA;
+static PagedArray pStartA, pEndA;   // id+1 живой трубы, начинающейся / кончающейся в позиции (для ALIGN)
 // Узлы множеств берутся из пула со списком свободных: вставка/удаление без обращений к malloc
 // (дыры появляются и исчезают на каждой операции, а в прямом поиске - сотни раз на операцию).
 template <class T> struct PoolAlloc {
@@ -953,7 +961,10 @@ int main() {
                     got = false; deadRem = false;
                     if (FIX_ALT && freeShare() > FREE_GATE) { ll ah, al; if (altFit(L, ah, al, shortTier) && ah + al != trench) { hs = ah; hl = al; got = true; } }
                 }
-                if (RO_ON && !gBfMode && got && (!shortTier || S_ON) && trench > GUARD && hs + hl != trench && (deadRem || (RO_ALL && hl > L))
+                // короткий уровень: прямой поиск только пока мы не отстали от теневого best-fit больше чем на RS_GATE м
+                // (абсолютный допуск тени SH_ABS для коротких траншей слишком велик)
+                bool rsOk = !shortTier || !gSh || trench <= gSh->trench + RS_GATE;
+                if (RO_ON && rsOk && !gBfMode && got && (!shortTier || S_ON) && trench > GUARD && hs + hl != trench && (deadRem || (RO_ALL && hl > L))
                     && tOps + 4LL * tR * tH <= tBudget && roTimeOk()) {
                     roH = tH;
 #ifdef SIM
@@ -1004,10 +1015,27 @@ int main() {
             }
             if (got) {
                 delRaw(hs, hl);
+                // Длинный уровень, удаляют в основном свежие трубы: остаток дыры кладём к более свежему соседу -
+                // его скорее удалят, и остаток сольётся с освободившимся местом, а не останется мёртвым.
+                bool alignR = false;
+                if (ALIGN && !phase && !learned && hl > L && hs + hl != trench && laid >= RO_FROM && trench > GUARD) {
+                    static bool fresh = false; static ll freshAt = -1;   // большинство рангов удалений < четверти живых
+                    if (freshAt < 0 || laid - freshAt >= 256) {
+                        freshAt = laid; int cnt = 0, lim = (int)(rkPos < RK_N ? rkPos : RK_N);
+                        for (int i = 0; i < lim; i++) if (rkBuf[i] * 4 < aliveCnt) cnt++;
+                        fresh = lim > 0 && cnt * 2 > lim;
+                    }
+                    if (fresh) {
+                        int a = hs > 0 ? pEndA.get(hs) : 0, b = pStartA.get(hs + hl);
+                        double ra = a ? (double)(aliveCnt - fenPre(a - 1)) : 1e18, rb = b ? (double)(aliveCnt - fenPre(b - 1)) : 1e18;
+                        alignR = ra < rb;   // левый сосед свежее - трубу к правому краю, остаток слева
+                    }
+                }
                 // Обречённую кладём к правому краю, но не в хвостовую дыру, если слева осталась бы щель
                 // короче любой встреченной трубы: такая щель внутри траншеи не заполнится никогда,
                 // а у конца траншеи этот остаток просто войдёт в следующую копку.
                 bool right = doomed && !learned && !(prior && hs + hl == trench && hl - L > 0 && hl - L < minLen);
+                if (alignR) right = true;
                 if (!right) { D = hs;           if (hl > L) addRaw(hs + L, hl - L); }
                 else        { D = hs + hl - L;  if (hl > L) addRaw(hs, hl - L); }
             } else {
@@ -1056,6 +1084,7 @@ int main() {
                 else        { D = ts + nl - L;    if (nl > L) addRaw(ts, nl - L); }
             }
 
+            if (ALIGN) { pStartA.set(D, (int)pipes.size() + 1); pEndA.set(D + L, (int)pipes.size() + 1); }
             fenAdd((int)pipes.size(), +1); notePlace();
             pipes.push_back({D, L}); runIdx.push_back(idx); runId.push_back(curRun);
             predDoom.push_back(prior ? (doomed ? 1 : 0) : -1);
@@ -1065,6 +1094,7 @@ int main() {
         } else {
             ll k = -cmd;
             answer1(pipes[k].first);
+            if (ALIGN) { pStartA.set(pipes[k].first, 0); pEndA.set(pipes[k].first + pipes[k].second, 0); }
             if (SH_ON && gSh) gSh->rem(k);
             noteRemove(aliveCnt - fenPre((int)k));   // сколько живых труб уложено после неё
             fenAdd((int)k, -1);
